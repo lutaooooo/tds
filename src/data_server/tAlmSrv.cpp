@@ -941,17 +941,16 @@ void almServer::rpc_updateStatus(json jAlm, RPC_RESP& resp, bool bSync)
 	if (jAlm.is_object()) {
 		jListTmp.push_back(jAlm);
 	}
-
 	json& jList = jAlm.is_object() ? jListTmp : jAlm;
 	for (int i = 0; i < jList.size(); i++) {
 		json& j = jList[i];
-		if (j["tag"] == nullptr && j["ioAddr"] == nullptr)
+		if (!j.contains("tag") && !j.contains("ioAddr"))
 		{
 			json jErr = "必须指定 tag 或者 ioAddr 字段";
 			resp.error = jErr.dump();
 			return;
 		}
-		if (j["type"] == nullptr)
+		if (!j.contains("type"))
 		{
 			json jErr = "必须指定 type 字段";
 			resp.error = jErr.dump();
