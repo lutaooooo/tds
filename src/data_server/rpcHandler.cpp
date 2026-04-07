@@ -5002,6 +5002,7 @@ void rpcHandler::rpc_input(json params, RPC_RESP& resp, RPC_SESSION& session) {
 				if (pmp) {
 					pmp->input(val, &file, &de.time);
 					if (pmp->m_bEnableIO) {
+						pmp->m_curValAttr.clear();
 						if (de.hasAttr) {
 							for (auto& iter : de.valAttr.items()) {
 								pmp->m_curValAttr[iter.key()] = iter.value().dump();
