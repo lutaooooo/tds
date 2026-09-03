@@ -1550,6 +1550,16 @@ void ioDev_tdsp::pullRecordFiles()
 		if (dot2 != std::string::npos) {
 			tagPath = tagPath.substr(dot2 + 1); // 去掉根组织(第一段)与组织编号(第二段)
 		}
+
+		// 分析位号: tagPath + 子服务侧流位号(点分层级),与录像保存目录(tagPath/streamTag)一致
+		// 例: tagPath="B"、流位号="摄像头2" -> "B.摄像头2"。仅传设备绑定位号时,
+		// IAS无法区分具体摄像头,也无法按位号定位录像目录回写db.json与曲线
+		std::string recTag = record.value("tag", "");
+		std::string analyseTag;
+		if (recTag.empty()) analyseTag = tagPath;
+		else if (tagPath.empty()) analyseTag = recTag;
+		else analyseTag = tagPath + "." + recTag;
+
 		for (char& c : tagPath) {
 			if (c == '.') c = '/';
 		}
@@ -1680,7 +1690,7 @@ void ioDev_tdsp::pullRecordFiles()
 
 			// 6. 向 IAS 发送分析请求(在后台线程执行,不阻塞IO线程)
 			// 曲线文件和db.json更新由IAS负责
-			std::thread([tag = m_strTagBind, time = timeStr]() {
+			std::thread([tag = analyseTag, time = timeStr]() {
 				json params;
 				params["tag"] = tag;
 				params["time"] = time;
