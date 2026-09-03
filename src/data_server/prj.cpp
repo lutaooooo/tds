@@ -620,8 +620,12 @@ bool project::handleRpc(string method, yyjson_val* params, RPC_RESP& resp, RPC_S
 		OBJ_PROP_SEL qFast = OBJ::parseQuerier(params);
 		yyjson_val* yyv_tag = yyjson_obj_get(params, "tag");
 		string fastTag = yyv_tag ? yyjson_get_str(yyv_tag) : "";
+		yyjson_val* yyv_fastRootTag = yyjson_obj_get(params, "rootTag");
+		string fastRootTag = yyv_fastRootTag ? yyjson_get_str(yyv_fastRootTag) : "";
+		//缓存的序列化结果不含tag字段，也不按rootTag过滤；需要tag或指定根位号的查询必须走完整序列化路径
 		if (qFast.getChild && qFast.leafType == "" && qFast.getStatus == false
-			&& fastTag == "" && !prj.m_moConfFileDump.empty()
+			&& fastTag == "" && fastRootTag == "" && qFast.getTag == false
+			&& !prj.m_moConfFileDump.empty()
 			&& (session.user == "admin" || session.user == "")) {
 			shared_lock<shared_mutex> lock(prj.m_csPrj);
 			lock_guard<mutex> dumpLock(prj.m_csMoConfDump);
