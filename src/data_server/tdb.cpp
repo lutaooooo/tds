@@ -639,11 +639,10 @@ namespace DB_FS {
 #ifdef _WIN32
 		_wfopen_s(&fp, DB_STR::utf8_to_utf16(path).c_str(), L"a");
 #else
-		fp = fopen(path.c_str(), "wb");
+		fp = fopen(path.c_str(), "ab");
 #endif
 		if (fp)
 		{
-			fseek(fp, 0, SEEK_END);
 			fwrite(data, 1, len, fp);
 			fclose(fp);
 			return true;

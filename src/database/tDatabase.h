@@ -31,6 +31,7 @@ SOFTWARE.
 
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <mutex>
 #ifdef ENABLE_QJS
@@ -588,11 +589,15 @@ struct DE_yyjson {
 	}
 };
 
+class FORECAST_DATA;
+
 class TAG_FILE_SET {
 public:
 	std::string tag;
 	std::string dbFileTag;
 	std::vector<DB_FILE*> fileList; //sort by time asending
+	FORECAST_DATA* pForecastData = nullptr;  // points to TDB::m_forecastMap[tag], read from memory in select
+	std::string m_maxFileDeTime;             // max de time of history data ("yyyy-MM-dd HH:mm:ss.mmm"), empty = no history data
 
 	~TAG_FILE_SET(){
 		if (fileList.size() > 0)
@@ -709,6 +714,7 @@ struct DE_SELECTOR {
 
 	std::string valType;  //transform de val to specified value
 	std::string deType;   //get de by default;  curveIdx to get curveIdx in curveList file
+	bool forecast = false;  //true = this query also covers forecast data
 	bool isValTypeNumber() {
 		if (valType == "float" || valType == "number") {
 			return true;
@@ -928,10 +934,27 @@ enum DE_JSON_TYPE {
 	DE_J_OBJ
 };
 
+//forecast data of one tag. held in memory for direct read in select; persisted to disk by refreshForecast.
+class FORECAST_DATA {
+public:
+	std::string tag;                 // full tag (same as map key)
+	std::string filePath;            // absolute path of the persistent file
+	yyjson_doc* m_doc = nullptr;     // root doc holding the data array (in memory)
+	yyjson_val* m_deList = nullptr;  // points to the data array inside m_doc; every de has forecast:true and sorted by time ascending
+
+	FORECAST_DATA() {}
+	~FORECAST_DATA();                // yyjson_doc_free(m_doc)
+
+	bool loadFromFile();             // disk -> memory (lazy load)
+	bool saveToFile();               // memory -> disk
+	void clear();                    // clear content (the object itself stays in map)
+};
+
 //use  "/"  but not "\\" in a path
 class TDB{
 public:
 	TDB();
+	~TDB();
 
 //interface
 	bool Open(std::string strDBUrl, fp_getTagsByTagSelector f = nullptr,std::string name="");
@@ -963,6 +986,8 @@ public:
 	void rpc_db_merge(std::string& sParams, std::string& rlt, std::string& err, std::string& queryInfo, std::string org, std::string language);
 	void rpc_db_merge(yyjson_val* params, std::string& rlt, std::string& err, std::string& queryInfo, std::string org, std::string language);
 	
+	void rpc_db_refreshForecast(yyjson_val* params, std::string& rlt, std::string& err);
+
 	bool Update(std::string tag, DB_TIME stTime, yyjson_val& jData);
 
 	void rpc_db_delete(std::string& sParams, std::string& rlt, std::string& err, std::string& queryInfo, std::string org, std::string language);
@@ -1044,10 +1069,19 @@ public:
 	std::unordered_map<std::string,std::vector<DE_BUFF>> m_insertBuff;
 	std::mutex m_csInsertBuff;
 
+	//TAG_TREE: persisted tag registry (stored at <dbRoot>/tagTree.txt)
+	void tagTreeLoad();                                    // load registry from disk (called at startup)
+	void tagTreeAdd(const std::string& tag);               // register a tag, persist to disk only when newly added
+	void tagTreeEnsureLoadedLocked();                      // lazy-load disk file, caller must hold m_csTagTree
+	void rpc_db_getTagTree(std::string& rlt, std::string& err); // RPC: return the full tag tree
+
 	//select
 	bool Select_Step_selectTags(DE_SELECTOR& deSel, SELECT_RLT& rlt);
 	bool Select_Step_loadFile(DE_SELECTOR& deSel, std::vector<TAG_FILE_SET*>& tagDBFileSet, SELECT_RLT& result);
 	bool Select_Step_loadDataElem(DE_SELECTOR& deSel, std::vector<TAG_FILE_SET*>& tagDBFileSet, std::vector<DATA_SET*>& outputDataSet, SELECT_RLT& result, yyjson_mut_doc* rlt_mut_doc);
+	bool Select_Step_LoadDe_History(DE_SELECTOR& deSel, TAG_FILE_SET& fSet, DATA_SET& fSetOut, std::string& tag, std::string& relTag, yyjson_val* deList, DE_JSON_TYPE deJsonType, SELECT_RLT& result, yyjson_mut_doc* rlt_mut_doc, bool& needMut, bool bForecast, size_t startIdx, const std::string& deTimeInit, DB_FILE* pdf);
+	bool Select_Step_LoadDe_Forecast(DE_SELECTOR& deSel, TAG_FILE_SET& fSet, DATA_SET& fSetOut, SELECT_RLT& result, yyjson_mut_doc* rlt_mut_doc);
+	FORECAST_DATA* getForecastData(const std::string& tag, bool bLoadFromDisk = true);
 	bool Select_Step_FilterByRelation(DE_SELECTOR& deSel, std::vector<DATA_SET*>& inputDataSet, std::vector<DATA_SET*>& outputDataSet);
 	bool Select_Step_doAggregate(DE_SELECTOR& deSel, std::vector<DATA_SET*>& tagDBFileSet,yyjson_mut_doc* rlt_mut_doc);
 	bool Select_Step_outputRows_MultiCol(DE_SELECTOR& deSel, std::vector<DATA_SET*>& tagDBFileSet, SELECT_RLT& result, yyjson_mut_doc* mut_doc);
@@ -1085,6 +1119,7 @@ public:
 	std::string getPath_dbRoot();
 	std::string getName_deFile(std::string tag, DB_TIME time);
 	std::string getDeFilesFolder(std::string& deListFolder, DB_TIME& time);
+	std::string getPath_forecastFile(std::string strTag) const;
 
 	std::string parseSuffix(std::string deFileUrl);
 	static bool fileExist(std::string pszFileName);
@@ -1096,6 +1131,13 @@ public:
 	std::string m_confPath;
 	std::string m_currentPath;
 	fp_dbLog m_fpDBLog;
+	std::map<std::string, FORECAST_DATA*> m_forecastMap;  // key: full tag
+	std::mutex m_csForecast;                              // guards m_forecastMap and FORECAST_DATA content
+
+	std::unordered_set<std::string> m_tagSet;   // in-memory tag registry
+	std::mutex m_csTagTree;                     // guards m_tagSet and the tag tree file
+	bool m_tagTreeLoaded = false;               // whether the disk file has been loaded
+	std::string m_tagTreePath;                  // <dbRoot>/tagTree.txt
 };
 unsigned int
 tdb_base64_encode(const unsigned char* in, unsigned int inlen, char* out);

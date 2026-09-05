@@ -639,11 +639,10 @@ namespace DB_FS {
 #ifdef _WIN32
 		_wfopen_s(&fp, DB_STR::utf8_to_utf16(path).c_str(), L"a");
 #else
-		fp = fopen(path.c_str(), "wb");
+		fp = fopen(path.c_str(), "ab");
 #endif
 		if (fp)
 		{
-			fseek(fp, 0, SEEK_END);
 			fwrite(data, 1, len, fp);
 			fclose(fp);
 			return true;
@@ -1141,6 +1140,15 @@ TDB::TDB()
 	t.detach();
 }
 
+TDB::~TDB()
+{
+	std::lock_guard<std::mutex> lk(m_csForecast);
+	for (auto& it : m_forecastMap) {
+		delete it.second;
+	}
+	m_forecastMap.clear();
+}
+
 std::string TDB::getPath_deFile(std::string strTag, DB_TIME stTime)
 {
 	if (m_timeUnit == BY_DAY) {
@@ -1259,6 +1267,35 @@ std::string TDB::getPath_dataFolder_NO_DB(std::string strTag, const DB_TIME& dat
 		return strURL;
 	}
 	return "";
+}
+
+std::string TDB::getPath_forecastFile(std::string strTag) const
+{
+	strTag = changeCharForFileName(strTag);
+	strTag = replaceStr(strTag, ".", "/");
+	return m_path + "/forecast/" + strTag + "/forecast.json";
+}
+
+FORECAST_DATA* TDB::getForecastData(const std::string& tag, bool bLoadFromDisk)
+{
+	std::lock_guard<std::mutex> lk(m_csForecast);
+	auto it = m_forecastMap.find(tag);
+	if (it != m_forecastMap.end()) {
+		return it->second;
+	}
+	if (!bLoadFromDisk) {
+		return nullptr;
+	}
+	//lazy load: load from disk when missing in map
+	FORECAST_DATA* p = new FORECAST_DATA();
+	p->tag = tag;
+	p->filePath = getPath_forecastFile(tag);
+	if (!p->loadFromFile()) {
+		delete p;
+		return nullptr;
+	}
+	m_forecastMap[tag] = p;
+	return p;
 }
 
 std::string TDB::getPath_dbRoot()
@@ -2876,6 +2913,7 @@ bool TDB::Select(DE_SELECTOR& deSel, SELECT_RLT& result) {
 		TAG_FILE_SET& fSet = *(new TAG_FILE_SET());
 		fSet.tag = result.tagSet[i];
 		fSet.dbFileTag = result.dbFileTagSet[i];
+		fSet.pForecastData = getForecastData(result.tagSet[i]);  //get forecast data ptr from map, nullptr if absent
 		tagFileSet.push_back(&fSet);
 	}
 	Select_Step_loadFile(deSel, tagFileSet, result);
@@ -3760,6 +3798,11 @@ bool TDB::parseDESelector(yyjson_val* yyParams, DE_SELECTOR& deSel, std::string&
 		deSel.deType = yyjson_get_str(yyv_deType);
 	}
 
+	yyjson_val* yyv_forecast = yyjson_obj_get(yyParams, "forecast");
+	if (yyv_forecast && yyjson_is_bool(yyv_forecast)) {
+		deSel.forecast = yyjson_get_bool(yyv_forecast);
+	}
+
 	//parse downsampling selector
 	yyjson_val* yyv_interval = yyjson_obj_get(yyParams, "interval");
 	if (yyv_interval && yyjson_is_int(yyv_interval))
@@ -4387,69 +4430,121 @@ bool do_iter(size_t& idx, size_t max, yyjson_val* deList, yyjson_val*& de, bool 
 	return true;
 }
 
-bool TDB::Select_Step_loadDataElem(DE_SELECTOR& deSel, std::vector<TAG_FILE_SET*>& tagDBFileSet, std::vector<DATA_SET*>& outputDataSet, SELECT_RLT& result, yyjson_mut_doc* rlt_mut_doc)
+FORECAST_DATA::~FORECAST_DATA() {
+	clear();
+}
+
+void FORECAST_DATA::clear() {
+	if (m_doc) {
+		yyjson_doc_free(m_doc);
+		m_doc = nullptr;
+	}
+	m_deList = nullptr;
+}
+
+bool FORECAST_DATA::loadFromFile() {
+	clear();
+	std::string data;
+	if (!DB_FS::readFile(filePath, data)) {
+		return false;
+	}
+	if (data == "") {
+		return false;
+	}
+	yyjson_doc* doc = yyjson_read(data.data(), data.size(), 0);
+	if (!doc) {
+		return false;
+	}
+	yyjson_val* root = yyjson_doc_get_root(doc);
+	yyjson_val* dataArr = yyjson_obj_get(root, "data");
+	if (!yyjson_is_arr(dataArr)) {
+		yyjson_doc_free(doc);
+		return false;
+	}
+	m_doc = doc;
+	m_deList = dataArr;
+	return true;
+}
+
+bool FORECAST_DATA::saveToFile() {
+	if (m_deList == nullptr) {
+		return false;
+	}
+	yyjson_mut_doc* wdoc = yyjson_mut_doc_new(nullptr);
+	yyjson_mut_val* root = yyjson_mut_obj(wdoc);
+	yyjson_mut_doc_set_root(wdoc, root);
+	yyjson_mut_obj_add_strcpy(wdoc, root, "tag", tag.c_str());
+	yyjson_mut_obj_add_val(wdoc, root, "data", yyjson_val_mut_copy(wdoc, m_deList));
+
+	size_t len = 0;
+	char* p = yyjson_mut_val_write(root, YYJSON_WRITE_PRETTY_TWO_SPACES, &len);
+	if (!p) {
+		yyjson_mut_doc_free(wdoc);
+		return false;
+	}
+	if (!TDB::fileExist(filePath)) {
+		DB_FS::createFolderOfPath(filePath);
+	}
+	bool bRet = DB_FS::writeFile(filePath, p, len);
+	free(p);
+	yyjson_mut_doc_free(wdoc);
+	return bRet;
+}
+
+//extract de array from file root (file data extraction, unified entry for both history and forecast)
+static yyjson_val* extractDeList(DB_FILE* pdf)
 {
-	bool needMut = false;
-	for (int tagIdx = 0; tagIdx < tagDBFileSet.size(); tagIdx++)
-	{
-		TAG_FILE_SET& fSet = *tagDBFileSet[tagIdx];
-		DATA_SET& fSetOut = *outputDataSet[tagIdx];
-		std::string& tag = fSet.tag; // std::string& instead of local var. yyjson do not copy
-		std::string& relTag = fSetOut.relTag;
-
-
-		for (int i = 0; i < fSet.fileList.size(); i++)
-		{
-			DB_FILE* pdf = fSet.fileList[i];
-
-			size_t idx, max;
-			yyjson_val* de = nullptr;
-			yyjson_val* lastDe = nullptr;
-			yyjson_val* deSnapshot = nullptr;
-			std::string snapshotDeTime = "";
-			int lastDeTime = 0;
-			int currDeTime = 0;
-			std::string deTime = pdf->ymd + " 00:00:00.000";
-			DB_TIME dbT;
-			std::string tmpTime;
-			std::string groupKeyVal;
-			bool ymdEqualityCheckedInDe = false; //check ymd in one de ,if not equal to db folder ymd throw exception
-			bool hasTimeStamp = (deSel.deType != "statisDe" && deSel.deType != "statisByDay" && deSel.deType != "statisByMonth");
-			yyjson_val* deList = nullptr;
-			yyjson_type type = yyjson_get_type(pdf->root);
-			if (type == YYJSON_TYPE_OBJ) { //file with desc
-				deList = yyjson_obj_get(pdf->root, "data");
-				if (deList == nullptr) { //copatible with sap  data_list[0].data mode
-					deList = yyjson_obj_get(pdf->root, "data_list");
-					if (yyjson_is_arr(deList) && yyjson_arr_size(deList) > 0) {
-						deList = yyjson_arr_get(deList, 0);
-						if (yyjson_is_obj(deList)) {
-							deList = yyjson_obj_get(deList, "data");
-						}
-					}
+	yyjson_val* deList = nullptr;
+	yyjson_type type = yyjson_get_type(pdf->root);
+	if (type == YYJSON_TYPE_OBJ) { //file with desc
+		deList = yyjson_obj_get(pdf->root, "data");
+		if (deList == nullptr) { //copatible with sap  data_list[0].data mode
+			deList = yyjson_obj_get(pdf->root, "data_list");
+			if (yyjson_is_arr(deList) && yyjson_arr_size(deList) > 0) {
+				deList = yyjson_arr_get(deList, 0);
+				if (yyjson_is_obj(deList)) {
+					deList = yyjson_obj_get(deList, "data");
 				}
 			}
-			else if (type == YYJSON_TYPE_ARR) {
-				deList = pdf->root;
-			}
-			else {
-				continue;
-			}
+		}
+	}
+	else if (type == YYJSON_TYPE_ARR) {
+		deList = pdf->root;
+	}
+	return deList;
+}
 
-			DE_JSON_TYPE deJsonType = DE_J_OBJ;
+bool TDB::Select_Step_LoadDe_History(DE_SELECTOR& deSel, TAG_FILE_SET& fSet, DATA_SET& fSetOut, std::string& tag, std::string& relTag, yyjson_val* deList, DE_JSON_TYPE deJsonType, SELECT_RLT& result, yyjson_mut_doc* rlt_mut_doc, bool& needMut, bool bForecast, size_t startIdx, const std::string& deTimeInit, DB_FILE* pdf)
+{
+	size_t idx, max;
+	yyjson_val* de = nullptr;
+	yyjson_val* lastDe = nullptr;
+	yyjson_val* deSnapshot = nullptr;
+	std::string snapshotDeTime = "";
+	int lastDeTime = 0;
+	int currDeTime = 0;
+	std::string deTime = deTimeInit;
+	DB_TIME dbT;
+	std::string tmpTime;
+	std::string groupKeyVal;
+	bool ymdEqualityCheckedInDe = false; //check ymd in one de ,if not equal to db folder ymd throw exception
+	bool hasTimeStamp = (deSel.deType != "statisDe" && deSel.deType != "statisByDay" && deSel.deType != "statisByMonth");
 
-			max = yyjson_arr_size(deList);
-			bool reverseIter = false;
-			if (deSel.timeSel.atomSelList[0].timeSetType == TSM_Last)
-			{
-				reverseIter = true;
-				idx = max;
-			}
-			else {
-				idx = -1;
-			}
+	max = yyjson_arr_size(deList);
+	bool reverseIter = false;
+	if (deSel.timeSel.atomSelList[0].timeSetType == TSM_Last)
+	{
+		reverseIter = true;
+		idx = max;
+	}
+	else {
+		idx = (startIdx > 0) ? startIdx - 1 : (size_t)-1;  //forecast starts from startIdx; history starts with idx=-1 (i.e. from 0)
+		if (startIdx > 0) {
+			de = yyjson_arr_get(deList, startIdx - 1);  //prefetch the de before startIdx so do_iter takes de at startIdx via unsafe_yyjson_get_next
+		}
+	}
 
-			while(do_iter(idx,max,deList,de,reverseIter)){
+	while(do_iter(idx,max,deList,de,reverseIter)){
 				//compatible with number save as a std::string,when in a aggr query,auto cast to number,info tips returneds
 				AutoLastDeSet autoSet(&de, &lastDe);
 				if (idx == 0)
@@ -4596,7 +4691,11 @@ bool TDB::Select_Step_loadDataElem(DE_SELECTOR& deSel, std::vector<TAG_FILE_SET*
 						szTime = yyjson_get_str(yyTime);
 					}
 
-					if (m_timeUnit == BY_DAY) {
+					if (bForecast) {
+						//forecast de time is normalized by refreshForecast to "yyyy-MM-dd HH:mm:ss.mmm", use directly as the standard time stamp
+						deTime = szTime;
+					}
+					else if (m_timeUnit == BY_DAY) {
 
 						const char* pHms = nullptr;
 						int hmsLen = 0;
@@ -4661,8 +4760,15 @@ bool TDB::Select_Step_loadDataElem(DE_SELECTOR& deSel, std::vector<TAG_FILE_SET*
 						//assert(false);
 					}
 
+					//history: track the latest de time of this tag's file data (regardless of later time/condition filter); forecast uses it as the discard threshold
+					if (!bForecast) {
+						if (deTime > fSet.m_maxFileDeTime) {
+							fSet.m_maxFileDeTime = deTime;
+						}
+					}
+
 					//boundary file is the first and last file of selected files,all de of files in the middle is selected,do not need to do time match
-					if (pdf->boundaryFile) {
+					if (bForecast || pdf->boundaryFile) {
 						if (!deSel.timeSel.Match(deTime)) {
 							if (deSel.timeSel.snapShot) {
 								de = deSnapshot;  //last de before not match is snapshot de. timeSel set to 00:00:00~snapshotTime
@@ -4796,6 +4902,65 @@ bool TDB::Select_Step_loadDataElem(DE_SELECTOR& deSel, std::vector<TAG_FILE_SET*
 					break;
 				}
 			}
+	return true;
+}
+
+bool TDB::Select_Step_LoadDe_Forecast(DE_SELECTOR& deSel, TAG_FILE_SET& fSet, DATA_SET& fSetOut, SELECT_RLT& result, yyjson_mut_doc* rlt_mut_doc)
+{
+	if (fSet.pForecastData == nullptr || fSet.pForecastData->m_deList == nullptr) {
+		return true;  // no forecast data: skip silently
+	}
+	std::lock_guard<std::mutex> lk(m_csForecast);  // exclusive with refreshForecast
+
+	yyjson_val* deList = fSet.pForecastData->m_deList;
+	size_t n = yyjson_arr_size(deList);
+
+	// forecast is sorted by time ascending: linear scan to the first de later than the latest history de,
+	// drop all before it (<= m_maxFileDeTime); break once found, the rest must be later, no more compare
+	size_t startIdx = 0;
+	if (!fSet.m_maxFileDeTime.empty()) {
+		for (; startIdx < n; startIdx++) {
+			yyjson_val* de = yyjson_arr_get(deList, startIdx);
+			yyjson_val* t = yyjson_obj_get(de, "time");
+			const char* s = yyjson_get_str(t);  // normalized by refreshForecast to "yyyy-MM-dd HH:mm:ss.mmm"
+			if (s != nullptr && strcmp(s, fSet.m_maxFileDeTime.c_str()) > 0) {
+				break;
+			}
+		}
+		if (startIdx >= n) {
+			return true;  // all not later than latest history data, nothing to output
+		}
+	}
+
+	bool needMut = false;
+	return Select_Step_LoadDe_History(deSel, fSet, fSetOut, fSet.tag, fSetOut.relTag, deList, DE_J_OBJ, result, rlt_mut_doc, needMut, true, startIdx, "", nullptr);
+}
+
+bool TDB::Select_Step_loadDataElem(DE_SELECTOR& deSel, std::vector<TAG_FILE_SET*>& tagDBFileSet, std::vector<DATA_SET*>& outputDataSet, SELECT_RLT& result, yyjson_mut_doc* rlt_mut_doc)
+{
+	bool needMut = false;
+	for (int tagIdx = 0; tagIdx < tagDBFileSet.size(); tagIdx++)
+	{
+		TAG_FILE_SET& fSet = *tagDBFileSet[tagIdx];
+		DATA_SET& fSetOut = *outputDataSet[tagIdx];
+		std::string& tag = fSet.tag; // std::string& instead of local var. yyjson do not copy
+		std::string& relTag = fSetOut.relTag;
+
+		//step1: load history data first (original fileList loop, de extraction moved to extractDeList)
+		for (int i = 0; i < fSet.fileList.size(); i++)
+		{
+			DB_FILE* pdf = fSet.fileList[i];
+			yyjson_val* deList = extractDeList(pdf);
+			if (deList == nullptr) {
+				continue;
+			}
+			std::string deTimeInit = pdf->ymd + " 00:00:00.000";
+			Select_Step_LoadDe_History(deSel, fSet, fSetOut, tag, relTag, deList, DE_J_OBJ, result, rlt_mut_doc, needMut, false, 0, deTimeInit, pdf);
+		}
+
+		//step2: load forecast data (same flow, drop de earlier than latest history data)
+		if (deSel.forecast && fSet.pForecastData != nullptr) {
+			Select_Step_LoadDe_Forecast(deSel, fSet, fSetOut, result, rlt_mut_doc);
 		}
 	}
 	return true;
@@ -4921,6 +5086,9 @@ bool TDB::handleRpc(const std::string& method, yyjson_val* params, std::string& 
 		}
 		rlt = DB_OK;
 	}
+	else if (method == "db.getTagTree") {
+		db.rpc_db_getTagTree(rlt, err);
+	}
 	else if (method.find("db.") != std::string::npos) {
 		yyjson_val* yyv_table = yyjson_obj_get(params, "table");
 		if (yyv_table) {
@@ -4956,6 +5124,9 @@ bool TDB::handleRpc(const std::string& method, yyjson_val* params, std::string& 
 			else if (method == "db.update") {
 				db.rpc_db_update(params, rlt, err, queryInfo, org, language);
 			}
+			else if (method == "db.refreshForecast") {
+				db.rpc_db_refreshForecast(params, rlt, err);
+			}
 			else if (method == "db.delete") {
 				db.rpc_db_delete(params, rlt, err, queryInfo, org, language);
 			}
@@ -4969,6 +5140,70 @@ bool TDB::handleRpc(const std::string& method, yyjson_val* params, std::string& 
 	}
 
 	return handled;
+}
+
+// ---- TAG_TREE: persisted tag registry, one tag per line at <dbRoot>/tagTree.txt ----
+// The in-memory set is an O(1) lookup during insert; the disk file is appended to
+// only when a brand-new tag appears, so the hot insert path is not slowed down.
+void TDB::tagTreeLoad()
+{
+	std::lock_guard<std::mutex> lock(m_csTagTree);
+	tagTreeEnsureLoadedLocked();
+}
+
+void TDB::tagTreeEnsureLoadedLocked()
+{
+	if (m_tagTreeLoaded)
+		return;
+	m_tagTreeLoaded = true;
+	std::string data;
+	if (m_tagTreePath == "" || !DB_FS::readFile(m_tagTreePath, data))
+		return;
+	size_t start = 0;
+	while (start < data.length()) {
+		size_t end = data.find('\n', start);
+		if (end == std::string::npos)
+			end = data.length();
+		if (end > start) {
+			std::string tag = data.substr(start, end - start);
+			if (!tag.empty() && tag[tag.length() - 1] == '\r')
+				tag.pop_back(); // tolerate CRLF line endings
+			if (!tag.empty())
+				m_tagSet.insert(tag);
+		}
+		start = end + 1;
+	}
+}
+
+void TDB::tagTreeAdd(const std::string& tag)
+{
+	if (!m_enableDB || tag.empty())
+		return;
+	std::lock_guard<std::mutex> lock(m_csTagTree);
+	tagTreeEnsureLoadedLocked();
+	if (m_tagSet.insert(tag).second && m_tagTreePath != "") {
+		// a brand-new tag: persist by appending one line
+		std::string line = tag + "\n";
+		DB_FS::appendWrite(m_tagTreePath, (char*)line.data(), line.length());
+	}
+}
+
+void TDB::rpc_db_getTagTree(std::string& rlt, std::string& err)
+{
+	std::lock_guard<std::mutex> lock(m_csTagTree);
+	tagTreeEnsureLoadedLocked();
+	yyjson_mut_doc* mdoc = yyjson_mut_doc_new(nullptr);
+	yyjson_mut_val* arr = yyjson_mut_arr(mdoc);
+	for (std::unordered_set<std::string>::iterator it = m_tagSet.begin(); it != m_tagSet.end(); ++it) {
+		yyjson_mut_val* v = yyjson_mut_strncpy(mdoc, it->c_str(), it->length());
+		yyjson_mut_arr_append(arr, v);
+	}
+	char* p = yyjson_mut_val_write(arr, 0, nullptr);
+	if (p) {
+		rlt = p;
+		free(p);
+	}
+	yyjson_mut_doc_free(mdoc);
 }
 
 void TDB::rpc_db_table_insert(yyjson_val* params, std::string& rlt, std::string& err, std::string& queryInfo, const std::string& org, const std::string& language) {
@@ -5811,6 +6046,8 @@ bool TDB::InsertDeJsonStr(std::string strTag, DB_TIME stTime, std::string& sDe, 
 	if (!m_enableDB)
 		return false;
 
+	tagTreeAdd(strTag); // register the tag into the tag tree (persist only when newly added)
+
 	if (buffered && m_enableInsertBuff) {
 		// same tag is not concurrently written; lock only protects the m_insertBuff map structure
 		m_csInsertBuff.lock();
@@ -6243,6 +6480,7 @@ bool TDB::Insert(std::string strTag, double dbVal, DB_TIME* stTime, bool buffere
 bool TDB::Insert(std::string strTag, std::string& sDeIdx, std::string& sDeCurve, DB_TIME* time) {
 	if (!m_enableDB)
 		return false;
+	tagTreeAdd(strTag); // register the tag into the tag tree (persist only when newly added)
 	DB_TIME stTime;
 	if (time) {
 		stTime = *time;
@@ -6378,6 +6616,131 @@ void TDB::rpc_db_merge(yyjson_val* params, std::string& rlt, std::string& err, s
 	else {
 		err = JSON_STR_VAL("merge fail,code: " + std::to_string(mergeRet));
 	}
+}
+
+void TDB::rpc_db_refreshForecast(yyjson_val* params, std::string& rlt, std::string& err)
+{
+	yyjson_val* yyv_tag = yyjson_obj_get(params, "tag");
+	yyjson_val* yyv_data = yyjson_obj_get(params, "data");
+	if (!yyjson_is_str(yyv_tag)) {
+		err = JSON_STR_VAL("must specify tag(str)");
+		return;
+	}
+	if (!yyjson_is_arr(yyv_data)) {
+		err = JSON_STR_VAL("must specify data(array)");
+		return;
+	}
+	std::string tag = yyjson_get_str(yyv_tag);
+
+	//db param: child db uses its own map
+	TDB* tdb = this;
+	yyjson_val* yyv_db = yyjson_obj_get(params, "db");
+	if (yyjson_is_str(yyv_db)) {
+		std::string dbName = yyjson_get_str(yyv_db);
+		tdb = db.getChildDB(dbName);
+		if (tdb == nullptr) {
+			err = JSON_STR_VAL("specified db not found");
+			return;
+		}
+	}
+
+	//step1: build new data array: normalize time to "yyyy-MM-dd HH:mm:ss.mmm", add forecast:true to every de
+	yyjson_mut_doc* mut_doc = yyjson_mut_doc_new(nullptr);
+	yyjson_mut_val* mut_root = yyjson_mut_obj(mut_doc);
+	yyjson_mut_doc_set_root(mut_doc, mut_root);
+	yyjson_mut_val* mut_data = yyjson_mut_arr(mut_doc);
+	yyjson_mut_obj_add_val(mut_doc, mut_root, "data", mut_data);
+
+	size_t idx, max = yyjson_arr_size(yyv_data);
+	std::vector<std::pair<std::string, yyjson_mut_val*>> sortedDe;
+	sortedDe.reserve(max);
+
+	for (idx = 0; idx < max; idx++) {
+		yyjson_val* de = yyjson_arr_get(yyv_data, idx);
+		if (!yyjson_is_obj(de)) {
+			err = JSON_STR_VAL("de must be object with time and val");
+			yyjson_mut_doc_free(mut_doc);
+			return;
+		}
+		yyjson_val* yyv_time = yyjson_obj_get(de, "time");
+		if (yyv_time == nullptr) {
+			err = JSON_STR_VAL("de must specify time");
+			yyjson_mut_doc_free(mut_doc);
+			return;
+		}
+		std::string deTime;
+		if (yyjson_is_int(yyv_time)) {
+			time_t t = yyjson_get_uint(yyv_time);
+			DB_TIME dbT;
+			dbT.fromUnixTime(t);
+			deTime = dbT.toStr();
+			if (deTime.length() == 19) {
+				deTime += ".000";
+			}
+		}
+		else if (yyjson_is_str(yyv_time)) {
+			deTime = yyjson_get_str(yyv_time);
+			if (deTime.length() == 19) {
+				deTime += ".000";
+			}
+		}
+		else {
+			err = JSON_STR_VAL("de time must be string or unix time");
+			yyjson_mut_doc_free(mut_doc);
+			return;
+		}
+
+		yyjson_mut_val* mut_de = yyjson_val_mut_copy(mut_doc, de);
+		yyjson_mut_obj_put(mut_de, yyjson_mut_strcpy(mut_doc, "time"), yyjson_mut_strcpy(mut_doc, deTime.c_str()));
+		yyjson_mut_obj_put(mut_de, yyjson_mut_strcpy(mut_doc, "forecast"), yyjson_mut_true(mut_doc));
+		sortedDe.push_back({ deTime, mut_de });
+	}
+
+	//step2: sort by time ascending (select can break comparison early)
+	std::sort(sortedDe.begin(), sortedDe.end(), [](const std::pair<std::string, yyjson_mut_val*>& a, const std::pair<std::string, yyjson_mut_val*>& b) {
+		return a.first < b.first;
+	});
+	for (auto& it : sortedDe) {
+		yyjson_mut_arr_append(mut_data, it.second);
+	}
+
+	//step3: convert to read-only doc and store into FORECAST_DATA
+	size_t len = 0;
+	char* json_str = yyjson_mut_val_write(mut_root, YYJSON_WRITE_NOFLAG, &len);
+	yyjson_mut_doc_free(mut_doc);
+	if (!json_str) {
+		err = JSON_STR_VAL("write forecast data fail");
+		return;
+	}
+	yyjson_doc* new_doc = yyjson_read(json_str, len, 0);
+	free(json_str);
+	if (!new_doc) {
+		err = JSON_STR_VAL("parse forecast data fail");
+		return;
+	}
+
+	//step4: get or create FORECAST_DATA, replace content only (object stays, pointers bound in select never dangle)
+	{
+		std::lock_guard<std::mutex> lk(tdb->m_csForecast);
+		FORECAST_DATA* p = nullptr;
+		auto it = tdb->m_forecastMap.find(tag);
+		if (it != tdb->m_forecastMap.end()) {
+			p = it->second;
+		}
+		else {
+			p = new FORECAST_DATA();
+			p->tag = tag;
+			p->filePath = tdb->getPath_forecastFile(tag);
+			tdb->m_forecastMap[tag] = p;
+		}
+		yyjson_doc_free(p->m_doc);
+		p->m_doc = new_doc;
+		yyjson_val* root = yyjson_doc_get_root(new_doc);
+		p->m_deList = yyjson_obj_get(root, "data");
+		p->saveToFile();  //persist to disk
+	}
+
+	rlt = JSON_STR_VAL("ok");
 }
 
 int TDB::Merge(std::string tag, const DB_TIME& stTime, const DB_TIME& stTimeRange1, const DB_TIME& stTimeRange2, const std::multimap<std::string, yyjson_val*>& mMergeParams)
@@ -7094,6 +7457,11 @@ bool TDB::Open(std::string strDBUrl, fp_getTagsByTagSelector f, std::string name
 	m_path = replaceStr(strDBUrl, "\\", "/");
 	m_name = name;
 	m_getTagsByTagSelector = f;
+	// reset tag tree state in case the database was re-opened with another path
+	m_tagTreePath = m_path + "/tagTree.txt";
+	m_tagTreeLoaded = false;
+	m_tagSet.clear();
+	tagTreeLoad(); // load the persisted tag tree at startup
 	return true;
 }
 
