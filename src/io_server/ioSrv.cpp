@@ -10,7 +10,7 @@
 #include "tSockSrv.h"
 
 #include "ioDev_tdsp.h"
-#include "ioDev_dcqk.h"
+#include "ioDev_tb3386.h"
 #include "base64.h"
 #include "webSrv.h"
 #include "statusServer.h"
@@ -1482,6 +1482,8 @@ bool ioServer::run() {
 		else {
 			LOG("[error][IO服务    ] 启动失败 UDP端口:" + str::fromInt(mbPort));
 		}
+		m_tcpSrv_rtu.push_back(ts);
+		m_udpSrv_rtu.push_back(us);
 	}
 
 	//io服务 502 Modbus over TCP
