@@ -248,14 +248,31 @@ static std::string fileTimeToString(stdfs::file_time_type ftime) {
 }
 
 
+// GCC10 libstdc++ 在 C locale 下宽窄 codecvt 转换非 ASCII 字符会抛异常，
+// Linux 下 path 原生编码即 UTF-8，直接窄字符构造与读取，仅 Windows 走宽字符
+static stdfs::path toFsPath(const string& utf8Path) {
+#ifdef _WIN32
+	return stdfs::path(utf8_to_utf16(utf8Path));
+#else
+	return stdfs::path(utf8Path);
+#endif
+}
+
+static string fsPathToUtf8(const stdfs::path& p) {
+#ifdef _WIN32
+	return utf16_to_utf8(p.wstring());
+#else
+	return p.string();
+#endif
+}
+
 static void getFolderList(std::vector<FS_FILE_INFO>& list, std::string strFolder, bool recursive = false) {
 	try
 	{
-		wstring wstrFolder = utf8_to_utf16(strFolder);
-		for (auto& i : stdfs::directory_iterator(wstrFolder)) {
+		for (auto& i : stdfs::directory_iterator(toFsPath(strFolder))) {
 			if (stdfs::is_directory(i.path())) {
 				FS_FILE_INFO fi;
-				fi.path = utf16_to_utf8(i.path().wstring());
+				fi.path = fsPathToUtf8(i.path());
 				size_t pos = fi.path.rfind("/");
 				fi.folderPath = fi.path.substr(0, pos);
 				fi.name = fi.path.substr(pos + 1, fi.path.length() - pos - 1);
@@ -272,7 +289,7 @@ static void getFolderList(std::vector<FS_FILE_INFO>& list, std::string strFolder
 				list.push_back(fi);
 
 				if (recursive) {
-					getFolderList(list, utf16_to_utf8(i.path().wstring()), recursive);
+					getFolderList(list, fsPathToUtf8(i.path()), recursive);
 				}
 			}
 		}
@@ -285,11 +302,10 @@ static void getFolderList(std::vector<FS_FILE_INFO>& list, std::string strFolder
 void getFileList(std::vector<FS_FILE_INFO>& list, std::string strFolder, bool recursive = false, std::string suffix = "*", std::vector<std::string>* exclude = nullptr) {
 	try
 	{
-		wstring wstrFolder = utf8_to_utf16(strFolder);
-		for (auto& i : stdfs::directory_iterator(wstrFolder)) {
+		for (auto& i : stdfs::directory_iterator(toFsPath(strFolder))) {
 			FS_FILE_INFO fi;
-			fi.path = utf16_to_utf8(i.path().wstring());
-			fi.name = utf16_to_utf8(i.path().filename().wstring());
+			fi.path = fsPathToUtf8(i.path());
+			fi.name = fsPathToUtf8(i.path().filename());
 			if (exclude != nullptr) {
 				bool excluded = false;
 				for (int i = 0; i < exclude->size(); i++) {
@@ -307,7 +323,7 @@ void getFileList(std::vector<FS_FILE_INFO>& list, std::string strFolder, bool re
 
 			if (stdfs::is_directory(i.path())) {
 				if (recursive) {
-					getFileList(list, utf16_to_utf8(i.path().wstring()), recursive, suffix, exclude);
+					getFileList(list, fsPathToUtf8(i.path()), recursive, suffix, exclude);
 				}
 			}
 			else {
