@@ -3973,6 +3973,16 @@ void rpcHandler::handleRpcCallAsyn(string& strReq, std::shared_ptr<TDS_SESSION> 
 
 bool rpcHandler::parseSessionUser(yyjson_val* jReq, RPC_RESP& rpcResp, std::shared_ptr<TDS_SESSION> pSession){
 	yyjson_val* yyUser = yyjson_obj_get(jReq, "user");
+	//兼容 user 放在 params 中的调用方式(标准 JSON-RPC 习惯将身份信息放入 params)
+	if (yyUser == nullptr || !yyjson_is_str(yyUser)) {
+		yyjson_val* yyParams = yyjson_obj_get(jReq, "params");
+		if (yyParams && yyjson_is_obj(yyParams)) {
+			yyjson_val* yyUserInParams = yyjson_obj_get(yyParams, "user");
+			if (yyUserInParams && yyjson_is_str(yyUserInParams)) {
+				yyUser = yyUserInParams;
+			}
+		}
+	}
 	json jUser;
 	if (yyUser && yyjson_is_str(yyUser))
 	{
@@ -4004,6 +4014,12 @@ bool rpcHandler::parseSessionUser(yyjson_val* jReq, RPC_RESP& rpcResp, std::shar
 
 	//非管理员账户必须预先分配对象树管理权限
 	if (pSession->role != "管理员") {
+		//用户不存在时返回明确错误,避免对 null json 取字段抛异常导致整个请求处理失败
+		if (jUser == nullptr) {
+			rpcResp.error = makeRPCError(RPC_ERROR_CODE::AUTH_userNotFound, "user not found");
+			return false;
+		}
+
 		bool isPermissionAssigned = true;
 		if (jUser["permission"].is_null()) {
 			isPermissionAssigned = false;
@@ -4024,7 +4040,19 @@ bool rpcHandler::parseSessionUser(yyjson_val* jReq, RPC_RESP& rpcResp, std::shar
 bool rpcHandler::userAccessAuthentication(yyjson_val* jReq, RPC_RESP& rpcResp, std::shared_ptr<TDS_SESSION> pSession) {
 	yyjson_val* yytoken = yyjson_obj_get(jReq, "token");
 	yyjson_val* yypwd = yyjson_obj_get(jReq, "pwd");
-	
+	//兼容 token/pwd 放在 params 中的调用方式(标准 JSON-RPC 习惯将身份信息放入 params)
+	yyjson_val* yyParams = yyjson_obj_get(jReq, "params");
+	if (yyParams && yyjson_is_obj(yyParams)) {
+		if (yytoken == nullptr || !yyjson_is_str(yytoken)) {
+			yyjson_val* v = yyjson_obj_get(yyParams, "token");
+			if (v && yyjson_is_str(v)) yytoken = v;
+		}
+		if (yypwd == nullptr || !yyjson_is_str(yypwd)) {
+			yyjson_val* v = yyjson_obj_get(yyParams, "pwd");
+			if (v && yyjson_is_str(v)) yypwd = v;
+		}
+	}
+
 	if (yytoken && yyjson_is_str(yytoken)){
 		pSession->token = yyjson_get_str(yytoken);
 	}

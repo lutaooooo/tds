@@ -1083,6 +1083,101 @@ void merge_chunks(const std::string& filename, int total_chunks) {
 	}
 }
 
+//网页访问鉴权(未登录访问受保护业务页面时跳转登录页)
+//返回 true 表示已处理(已发送响应);返回 false 表示放行继续静态服务
+static bool fn_checkWebPageAuth(struct mg_connection* c, struct mg_http_message* hm)
+{
+	//仅当开启用户认证时才启用
+	if (tds == nullptr || tds->conf == nullptr || !tds->conf->enableAccessCtrl) {
+		return false;
+	}
+
+	//取 URI(去掉 query 参数)
+	std::string uri = uriFormbuff(hm->uri.ptr);
+	if (uri.empty()) {
+		uri = str::fromBuff(hm->uri.ptr, hm->uri.len);
+	}
+	//去掉 ? 后的参数部分
+	size_t qpos = uri.find('?');
+	if (qpos != std::string::npos) {
+		uri = uri.substr(0, qpos);
+	}
+
+	//============ 严格鉴权路径判定 ============
+	//【必要说明】为避免"登录页死循环",下面必须豁免"未登录就能渲染登录页"的最小资源集;
+	//豁免范围之外的任何文件(含 /common/ /config/ /files/ /db/ 全部内容、业务页面的
+	//js/css/图片/字体等)一律要求登录,未登录统一 302 跳转登录页。
+
+	//(1) 登录页本身目录(html/css/js/img 均在此前缀下,是登录入口,未登录必须能完整渲染)
+	//    风险:登录页 UI 完全公开,不含业务数据;若担心 UI 泄露可后续改为一次性动态口令下发
+	if (uri.find("/app/login") == 0) {
+		return false;
+	}
+	//(2) 登录页引用的共享主题样式(css/dark*.css)与公共 JS 库(crypto-js/ua-parser)
+	//    风险:公共库文件公开,无业务信息;业务页面引用同路径库在登录后仍可正常加载,
+	//         未登录时也可取得这些库(不敏感)。若删除此豁免,登录页将无法加密传输密码。
+	if (uri.find("/app/tds/dark.css") == 0 || uri.find("/app/tds/darkblue.css") == 0) {
+		return false;
+	}
+	if (uri == "/app/js/crypto-js.min.js" || uri == "/app/js/ua-parser.min.js" ||
+		uri == "/app/js/crypto-js.js" || uri == "/app/js/ua-parser.js") {
+		return false;
+	}
+	//(3) 根页面(登录跳转壳,其 JS 会决定是否跳登录页,不含业务数据)
+	//    风险:根页面 HTML/JS 公开;它仅作路由壳。若删除此豁免,未登录访问 "/" 无法进入登录流程
+	if (uri == "/" || uri == "/index.html") {
+		return false;
+	}
+	//(4) 登录页/根页面加载所需的版本与 UI 配置(极小,仅版本号与主题配置,无敏感信息)
+	//    风险:暴露版本号;可接受。若删除此豁免,登录页将因 version.js 加载失败而停用。
+	if (uri == "/version.js" || uri == "/version.json" || uri == "/favicon.ico" ||
+		uri == "/config/ui.ini") {
+		return false;
+	}
+	//(5) 调试/API 页面(仅开发自测;其中数据接口本身受 RPC token 校验,HTML 壳无业务数据)
+	//    风险:开发期调试页可达;生产环境若担忧,应从 mg_http_match_uri 分派处一并禁用。
+	if (uri.find("/app/apitest") == 0 || uri.find("/app/debugapi") == 0 ||
+		uri.find("/app/debug") == 0) {
+		return false;
+	}
+	//======== 到此为止:其余一切(含任意扩展名的静态资源、HTML、数据、下载)均要求登录 ========
+
+	//从 Cookie 中取 user / token(登录成功后前端 document.cookie 已写入)
+	std::string sUser, sToken;
+	mg_str* mgs_cookie = mg_http_get_header(hm, "Cookie");
+	if (mgs_cookie != nullptr) {
+		std::string sCookie = str::fromBuff(mgs_cookie->ptr, mgs_cookie->len);
+		std::map<std::string, std::string> mapCookie;
+		parseCookie(sCookie, mapCookie);
+		//parseCookie 未做 key 的空格裁剪(cookie 头常以 "; " 分隔,导致 key 为 " token"),
+		//故统一按裁剪后的 key 取值
+		for (auto& kv : mapCookie) {
+			std::string k = kv.first;
+			size_t b = k.find_first_not_of(" \t");
+			if (b == std::string::npos) continue;
+			std::string t = k.substr(b);
+			if (t == "user") sUser = kv.second;
+			else if (t == "token") sToken = kv.second;
+		}
+		if (sUser.empty()) {
+			if (mapCookie.find("user") != mapCookie.end()) sUser = mapCookie["user"];
+		}
+		if (sToken.empty()) {
+			if (mapCookie.find("token") != mapCookie.end()) sToken = mapCookie["token"];
+		}
+	}
+
+	//cookie 缺失或无有效 token -> 跳转登录页
+	if (sUser.empty() || sToken.empty() || !userMng.checkToken(sUser, sToken)) {
+		LOG("[warn]网页访问鉴权未通过,uri=%s,user=%s,跳转登录页", uri.c_str(), sUser.c_str());
+		std::string resHeader = "Location:/app/login/index.html\r\n";
+		resHeader += "Cache-Control:no-cache\r\n";
+		mg_http_reply(c, 302, resHeader.c_str(), "");
+		return true;
+	}
+	return false;
+}
+
 //static void fn(struct mg_connection* c, int ev, void* ev_data, void* fn_data) 
 static void fn(struct mg_connection* c, int ev,void* ev_data)
 {
@@ -1448,6 +1543,10 @@ static void fn(struct mg_connection* c, int ev,void* ev_data)
 			mg_http_reply(c, 301, sHeader.c_str(), "");
 		}
 		else {
+			//网页访问鉴权:未登录访问受保护业务页面 -> 跳转登录页
+			if (fn_checkWebPageAuth(c, hm)) {
+				return;
+			}
 			struct mg_http_serve_opts opts;
 			memset(&opts, 0, sizeof(opts));
 			string dir = "/=" + rootDir + ",/common/=" + ui_common_dir + ",/config/=" + confDir + ",/files/=" + filesDir + ",/app/topo/res/=" + topoDir + ",/app//topo/res/=" + topoDir + ",/db/=" + dbDir;

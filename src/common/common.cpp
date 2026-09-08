@@ -2017,8 +2017,10 @@ namespace common {
 		for (char& c : uuid) {
 			if (c == 'x' || c == 'y') {
 				int n = dis(gen);
-				int r = (n & 0x3) | 0x8;
-				c = (c == 'x') ? "0123456789abcdef"[n] : "89ab"[r];
+				// 'y' 位为 UUID v4 变体位,取值范围 8~b。注意下标须用 n&0x3(0~3),
+				// 之前写成 "89ab"[(n&0x3)|0x8] 导致越界读到 '\0',token 混入空字符,
+				// 使 cookie/URL 传输时被截断,鉴权失效。修正为 "89ab"[n & 0x3]。
+				c = (c == 'x') ? "0123456789abcdef"[n] : "89ab"[n & 0x3];
 			}
 			++pos;
 		}
