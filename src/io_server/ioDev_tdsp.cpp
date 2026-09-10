@@ -1542,14 +1542,12 @@ void ioDev_tdsp::pullRecordFiles()
 		size_t pos = fname.rfind('/');
 		if (pos != std::string::npos) fname = fname.substr(pos + 1);
 
-		// 位号目录: 设备绑定位号 m_strTagBind 去掉前两段(根组织+组织编号)后点分转斜杠路径
-		// 例: "202606.01.科技大学A幢.二楼.摄像头1" -> "科技大学A幢/二楼/摄像头1"
-		std::string tagPath = m_strTagBind;
-		size_t dot1 = tagPath.find('.');
-		size_t dot2 = (dot1 != std::string::npos) ? tagPath.find('.', dot1 + 1) : std::string::npos;
-		if (dot2 != std::string::npos) {
-			tagPath = tagPath.substr(dot2 + 1); // 去掉根组织(第一段)与组织编号(第二段)
-		}
+		// 位号目录: 主服务完整位号 = 设备绑定位号(主服务对象树中的位号，OBJ::getTag
+		// 规则不含工程根名)。仅当绑定位号带了工程根名前缀时裁掉根名，其余层级都是
+		// 真实路径不能裁剪——录像/分析/曲线必须落在主服务完整位号对应的目录，
+		// 否则历史数据页按位号定位不到数据(如 tagBind=1号线.天府广场.1号电梯
+		// 裁掉两段会错成 1号电梯)
+		std::string tagPath = TAG::trimRoot(m_strTagBind, prj.getName(""));
 
 		// 分析位号: tagPath + 子服务侧流位号(点分层级),与录像保存目录(tagPath/streamTag)一致
 		// 例: tagPath="B"、流位号="摄像头2" -> "B.摄像头2"。仅传设备绑定位号时,
