@@ -477,6 +477,19 @@ void StreamNode::threadCtrl_rtspClient() {
                     keyframe_cache_.pkts.clear();
                     keyframe_cache_.complete = false;
                 }
+                // 速率坍塌检测状态随新连接复位（基准取当前累计值，避免首窗口把
+                // 历史累计当成速率）
+                {
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    rate_prev_pkts_ = stats_.frames_received;
+                }
+                src_peak_pps_ = 0;
+                src_low_ticks_ = 0;
+                // 关键帧不完整自愈状态同样复位（新连接视为重新开始）
+                kf_had_complete_ = false;
+                kf_last_size_ = 0;
+                kf_idr_mark_ = 0;
+                kf_stall_ticks_ = 0;
             }
             else {
                 {
@@ -502,6 +515,95 @@ void StreamNode::threadCtrl_rtspClient() {
                 session_relay_push_.doReconnect();
                 session_relay_push_.close();
             }
+        }
+
+        // 源速率坍塌自愈：RTSP 心跳正常但媒体跌至涓流（中继半死）时，
+        // rtp_timeout_ 永不触发（包仍零星到达），节点保持 STREAMING 假活，
+        // 所有观众无限期黑屏。对曾经健康（峰值包速率达阈值）的拉流，
+        // 持续涓流超过 src_low_seconds_ 秒则主动拆掉重连。
+        // 峰值不足阈值的流（原生低帧率相机）不做此判定，避免误伤。
+        //
+        // 注意：智能编码相机在画面静止时帧率/包速率会合法地骤降——
+        // 此时关键帧缓存仍完整、新观众可正常起播，不满足重置条件。
+        // 重置只在「观众实际无法起播（缓存无完整关键帧）」时执行，
+        // 否则静止场景的每次误重置都会造成参考链断裂→丢帧→花屏。
+        bool collapsed = false;
+        if (isPulling_) {
+            uint64_t nowPkts = 0;
+            bool kfComplete = false;
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                nowPkts = stats_.frames_received;
+            }
+            {
+                std::lock_guard<std::mutex> lock(keyframe_cache_mutex_);
+                kfComplete = keyframe_cache_.complete;
+            }
+            const uint32_t pps = static_cast<uint32_t>((nowPkts - rate_prev_pkts_) / 2); // 检测周期 2 秒
+            rate_prev_pkts_ = nowPkts;
+
+            if (pps > src_peak_pps_) src_peak_pps_ = pps;
+
+            if (src_peak_pps_ >= src_peak_min_pps_) {
+                if (pps < src_low_pps_ && !kfComplete) {
+                    src_low_ticks_++;
+                    if (src_low_ticks_ * 2 >= src_low_seconds_) {
+                        LOG("[StreamNode]tag=%s, 源包速率坍塌且无完整关键帧（峰值%u/秒，当前%u/秒，持续%d秒），重置拉流连接",
+                            config_.tag.c_str(), src_peak_pps_, pps, src_low_ticks_ * 2);
+                        collapsed = true;
+                    }
+                }
+                else {
+                    src_low_ticks_ = 0;
+                }
+            }
+        }
+
+        // 关键帧长期不完整自愈：包速率尚可（高于涓流阈值，速率坍塌不触发），
+        // 但源反复中途丢弃关键帧、永远凑不齐一帧——观众持续黑屏 + PLI 风暴。
+        // 判定：本连接曾有过完整关键帧，之后 IDR 包数超过"上次完整帧大小×2+100"
+        // 仍未再次完整 → 重置拉流。正常 GOP 间隔内 IDR 包数 ≈ 一次完整帧大小，不误触发。
+        if (!collapsed && isPulling_) {
+            bool kfComplete = false; size_t kfSize = 0; uint64_t idrTotal = 0;
+            {
+                std::lock_guard<std::mutex> lock(keyframe_cache_mutex_);
+                kfComplete = keyframe_cache_.complete;
+                kfSize = keyframe_cache_.pkts.size();
+                idrTotal = keyframe_cache_.idr_total;
+            }
+            if (kfComplete) {
+                kf_had_complete_ = true;
+                kf_last_size_ = kfSize > 0 ? kfSize : kf_last_size_;
+                kf_idr_mark_ = idrTotal;
+                kf_stall_ticks_ = 0;
+            }
+            else if (kf_had_complete_) {
+                kf_stall_ticks_++;
+                if (kf_stall_ticks_ >= 3
+                    && idrTotal - kf_idr_mark_ > (uint64_t)(kf_last_size_ * 2 + 100)) {
+                    LOG("[StreamNode]tag=%s, 关键帧长期不完整（上次完整帧%zu包，之后又收%llu个IDR包仍未凑齐），重置拉流连接",
+                        config_.tag.c_str(), kf_last_size_,
+                        (unsigned long long)(idrTotal - kf_idr_mark_));
+                    collapsed = true;
+                }
+            }
+        }
+
+        if (collapsed) {
+            session_origin_.recordError("source rate collapse / keyframe stall");
+            isPulling_ = false;
+            session_origin_.close();
+            session_relay_push_.close();
+            if (recv_thread_origin_rtp_.joinable()) {
+                recv_thread_origin_rtp_.join();
+            }
+            src_low_ticks_ = 0;
+        }
+
+        // 周期性向源发送 RTCP RR（保活）：多数相机/中继在长时间收不到 RR 时
+        // 会停发 RTP（实测 ~4 分钟一次），这是周期性卡死的直接根源之一
+        if (isPulling_) {
+            sendOriginRtcpRR();
         }
 
         // 心跳保活
@@ -535,6 +637,61 @@ void StreamNode::threadCtrl_rtspClient() {
     }
 }
 
+
+// 周期性向源发送 RTCP RR（保活）：多数相机/中继在长时间收不到 RTCP 时
+// 会停发 RTP（实测该中继约每 4 分钟停一次，造成周期性卡死）。
+// RFC 3550 要求接收端定期发送 RR。UDP 拉流经 rtcp_socket 发送。
+void StreamNode::sendOriginRtcpRR() {
+    if (!isPulling_) return;
+    if (session_origin_.transport_mode != TransportMode::UDP) return;
+    if (session_origin_.rtcp_socket == kInvalidSocket) return;
+
+    const uint32_t mediaIp = origin_media_ip_;
+    const uint32_t srcSsrc = origin_last_ssrc_;
+    if (mediaIp == 0 || srcSsrc == 0) return;
+    if (session_origin_.server_rtcp_port <= 0) return;
+
+    // 本端报告 SSRC：随机生成一次
+    uint32_t mySsrc = origin_report_ssrc_;
+    if (mySsrc == 0) {
+        uint32_t v = (uint32_t)(std::chrono::system_clock::now().time_since_epoch().count()
+                                ^ (uintptr_t)this ^ 0x5EED0000);
+        if (v == 0) v = 1;
+        origin_report_ssrc_ = v;
+        mySsrc = v;
+    }
+
+    uint8_t rr[32];
+    memset(rr, 0, sizeof(rr));
+    rr[0] = 0x81;               // V=2, P=0, RC=1
+    rr[1] = 201;                // PT = Receiver Report
+    rr[2] = 0; rr[3] = 7;       // length = 7 words（32 字节）
+    rr[4] = (uint8_t)(mySsrc >> 24); rr[5] = (uint8_t)(mySsrc >> 16);
+    rr[6] = (uint8_t)(mySsrc >> 8);  rr[7] = (uint8_t)mySsrc;
+    // report block：源的 SSRC
+    rr[8]  = (uint8_t)(srcSsrc >> 24); rr[9]  = (uint8_t)(srcSsrc >> 16);
+    rr[10] = (uint8_t)(srcSsrc >> 8);  rr[11] = (uint8_t)srcSsrc;
+    // fraction lost / cumulative lost = 0（本地无感知丢失；丢包统计由源自行判断）
+    // extended highest sequence number
+    uint32_t ext = origin_seq_ext_;
+    rr[16] = (uint8_t)(ext >> 24); rr[17] = (uint8_t)(ext >> 16);
+    rr[18] = (uint8_t)(ext >> 8);  rr[19] = (uint8_t)ext;
+    // jitter / LSR / DLSR 保持 0
+
+    sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons((uint16_t)session_origin_.server_rtcp_port);
+    uint32_t ip = mediaIp;  // 网络序
+    memcpy(&dest.sin_addr, &ip, 4);
+
+    int sent = sendto(session_origin_.rtcp_socket, (const char*)rr, sizeof(rr), 0,
+                      (struct sockaddr*)&dest, sizeof(dest));
+    if (sent < 0) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        stats_.errors++;
+    }
+}
 
 SESSION_STATE StreamNode::getState() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -751,6 +908,11 @@ void StreamNode::threadCtrl_webrtcServer(std::shared_ptr<STREAM_SESSION> session
 
     auto dtls_start = std::chrono::steady_clock::now();
 
+    // 空闲看门狗线程启动即武装：若客户端从未发来任何包（浏览器没拿到 SDP Answer、
+    // 中途放弃/页面直接关闭），此前 last_stun_bind_req_time 恒为 0，两道超时全部
+    // 失效，ICE 线程与会话永久泄漏（hasWorkToDo 恒真还会阻止按需流空闲回收）
+    session->last_stun_bind_req_time = std::chrono::system_clock::now();
+
     while (session->ctrl_thread_webrtc_server_running_) {
         struct sockaddr_in peer;
         socklen_t peerLen = sizeof(peer);
@@ -758,12 +920,19 @@ void StreamNode::threadCtrl_webrtcServer(std::shared_ptr<STREAM_SESSION> session
                            (char*)buf, sizeof(buf), 0,
                            (struct sockaddr*)&peer, &peerLen);
 
-        // 检查 DTLS 握手是否超时（8秒内 state 未到 streaming）
-        if (session->state_ >= SESSION_STATE::SESSION_HANDSHAKING && session->state_ < SESSION_STATE::SESSION_STREAMING) {
+        // 未到 streaming 的会话受超时保护：
+        // - IDLE/CONNECTING（客户端还没发来任何包）给 15 秒，覆盖浏览器拿到
+        //   SDP Answer 前的延迟（RPC 链路慢时可达数秒）
+        // - HANDSHAKING（DTLS 进行中）维持 8 秒，dtls_start 随 STUN/DTLS 包刷新
+        // 此前条件要求 state>=HANDSHAKING，而会话初始为 IDLE 且无人置 CONNECTING，
+        // 该超时从不触发，僵死会话无法清理
+        if (session->state_ < SESSION_STATE::SESSION_STREAMING) {
             auto now = std::chrono::steady_clock::now();
-            if (now - dtls_start > std::chrono::seconds(8)) {
-                LOG("[ICE] DTLS handshake timeout (8s), state=%d",
-                    (int)session->state_);
+            auto deadline = (session->state_ >= SESSION_STATE::SESSION_HANDSHAKING)
+                ? std::chrono::seconds(8) : std::chrono::seconds(15);
+            if (now - dtls_start > deadline) {
+                LOG("[ICE] session timeout (%ds), state=%d, client never reached streaming",
+                    (int)deadline.count(), (int)session->state_);
                 session->ctrl_thread_webrtc_server_running_ = false;
                 break;
             }
@@ -1037,6 +1206,17 @@ void StreamNode::onRecvOriginRtpPkt(std::shared_ptr<RTPPacket> pkt, STREAM_SESSI
         LOG("[RTSP-Recv] Captured video SSRC=%u from origin", pkt->ssrc);
     }
 
+    // 源 RTCP RR 保活跟踪：最近 SSRC 与扩展序号（处理回绕）
+    origin_last_ssrc_ = pkt->ssrc;
+    if (!origin_seq_init_) {
+        origin_seq_ext_ = pkt->sequence_number;
+        origin_seq_init_ = true;
+    }
+    else {
+        int16_t delta = (int16_t)(pkt->sequence_number - (uint16_t)origin_seq_ext_);
+        origin_seq_ext_ = origin_seq_ext_ + (uint32_t)(int32_t)delta;
+    }
+
     // 序列化RTP包
     pkt->data = pkt->serialize();
 
@@ -1090,12 +1270,20 @@ void StreamNode::onRecvOriginRtpPkt(std::shared_ptr<RTPPacket> pkt, STREAM_SESSI
     // 无锁读写 std::vector 会造成堆破坏（见 streamNode.h 成员注释）。
     {
         std::lock_guard<std::mutex> lock(keyframe_cache_mutex_);
-        if (pkt->isLastIdrNalu == false && pkt->isIdrNalu == true) {
-            keyframe_cache_.pkts.clear();
-            keyframe_cache_.complete = false;
-        }
         if (pkt->isIdrNalu) {
+            // 缓存只保留最近一个 IDR 帧。识别到新一帧开始时先清空：
+            // - 上一包不是 IDR（正常 GOP 边界）
+            // - 时间戳变化（全 I 流/连续 IDR：此前不清空会把新帧追加到旧帧后，
+            //   重发时连发多帧 IDR 且缓存无界增长）
+            if (pkt->isLastIdrNalu == false
+                || (keyframe_cache_.has_frame && keyframe_cache_.frame_ts != pkt->timestamp)) {
+                keyframe_cache_.pkts.clear();
+                keyframe_cache_.complete = false;
+            }
             keyframe_cache_.pkts.push_back(pkt->data);
+            keyframe_cache_.frame_ts = pkt->timestamp;
+            keyframe_cache_.has_frame = true;
+            keyframe_cache_.idr_total++;
             if (pkt->marker) keyframe_cache_.complete = true;
         }
     }
@@ -1201,6 +1389,12 @@ void StreamNode::threadRecv_originPull() {
         }
 
         if (received > 12) {  // RTP包最小12字节头
+            // 记录源媒体地址（RTCP RR 的发送目标）
+            if (origin_media_ip_ == 0) {
+                in_addr a;
+                a.s_addr = inet_addr(src_ip.c_str());
+                if (a.s_addr != INADDR_NONE) origin_media_ip_ = a.s_addr;
+            }
             const auto now = std::chrono::steady_clock::now();
 
             {

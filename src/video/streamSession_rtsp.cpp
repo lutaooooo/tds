@@ -190,6 +190,9 @@ bool STREAM_SESSION::open(const STREAM_SESSION* origin_session)
                 size_t dash = server_port.find('-');
                 if (dash != std::string::npos) {
                     server_rtp_port = std::stoi(server_port.substr(0, dash));
+                    // 源的 RTCP 端口（接收端周期性发送 RTCP RR 保活用，
+                    // 多数相机/中继长时间收不到 RR 会停发 RTP）
+                    server_rtcp_port = std::stoi(server_port.substr(dash + 1));
                 }
             }
             else if (token.find("source=") != std::string::npos) {

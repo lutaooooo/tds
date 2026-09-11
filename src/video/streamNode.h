@@ -49,8 +49,12 @@
 // H.265 (HEVC) NAL unit type constants (RFC 7798)
 #define NAL_TYPE_H265_TRAIL_N     0
 #define NAL_TYPE_H265_TSA_N       1
+#define NAL_TYPE_H265_BLA_W_LP    16
+#define NAL_TYPE_H265_BLA_W_RADL  17
+#define NAL_TYPE_H265_BLA_N_LP    18
 #define NAL_TYPE_H265_IDR_W_RADL  19
 #define NAL_TYPE_H265_IDR_N_LP    20
+#define NAL_TYPE_H265_CRA         21
 #define NAL_TYPE_H265_VPS         32
 #define NAL_TYPE_H265_SPS         33
 #define NAL_TYPE_H265_PPS         34
@@ -235,6 +239,13 @@ public:
     struct KfCache {
         std::vector<std::vector<uint8_t>> pkts;
         bool complete = false;
+        // 缓存帧的 RTP 时间戳：同一帧的分片共享时间戳，
+        // 用于识别全 I 流/连续 IDR 中新一帧的开始
+        uint32_t frame_ts = 0;
+        bool has_frame = false;
+        // 本连接累计收到的关键帧（IDR/CRA 等）RTP 包总数（含未组成完整帧的），
+        // 供"关键帧长期不完整"自愈判定：碎片化涓流时该值持续增长而 complete 不置位
+        uint64_t idr_total = 0;
     };
     KfCache keyframe_cache_;
     // 保护 keyframe_cache_ 与 last_nalu_was_idr_：sendRTPPacketToClients 可能被多个线程并发调用
@@ -269,6 +280,32 @@ public:
     // 统计
     Statistics stats_;
 
+    // 源速率坍塌自愈状态（仅 threadCtrl_rtspClient 线程读写）
+    // RTSP 心跳正常但媒体跌至涓流（中继半死）时 rtp_timeout_ 不会触发
+    // （包仍零星到达），需要按包速率判定并主动重连
+    uint64_t rate_prev_pkts_ = 0;   // 上个检测周期的累计收包数
+    uint32_t src_peak_pps_ = 0;     // 本连接出现过的峰值包速率
+    int src_low_ticks_ = 0;         // 连续低于低速率阈值的检测周期数
+    uint32_t src_low_pps_ = 120;    // 低速率阈值（包/秒）
+    uint32_t src_peak_min_pps_ = 300; // 判定"曾经健康"的峰值包速率下限
+    int src_low_seconds_ = 20;      // 持续涓流多少秒后重置拉流
+
+    // 关键帧长期不完整自愈：另一种中继半死形态——包速率尚可（高于涓流阈值）
+    // 但反复中途丢弃关键帧、永远凑不齐一帧。判定：本连接曾有过完整关键帧，
+    // 之后累计 IDR 包数超过"上次完整帧大小×2+100"仍未再次完整 → 重置拉流。
+    // （正常 GOP 间隔内 IDR 包数 ≈ 一次完整帧大小，不会误触发）
+    bool kf_had_complete_ = false;
+    size_t kf_last_size_ = 0;       // 上次完整关键帧的包数
+    uint64_t kf_idr_mark_ = 0;      // 上次完整时的 idr_total 基准
+    int kf_stall_ticks_ = 0;        // 连续不完整的检测周期数
+
+    // 源 RTCP RR 保活状态
+    std::atomic<uint32_t> origin_seq_ext_{0};    // 源 RTP 扩展序号（低 16 位为 seq，高位为回绕周期）
+    std::atomic<bool> origin_seq_init_{false};
+    std::atomic<uint32_t> origin_last_ssrc_{0};  // 源最近一个 RTP 包的 SSRC
+    std::atomic<uint32_t> origin_media_ip_{0};   // 源媒体地址（首个 RTP 包来源，IPv4 网络序）
+    std::atomic<uint32_t> origin_report_ssrc_{0};// 本端 RR 的发送 SSRC（随机生成一次）
+
     // 回调函数
     ErrorCallback error_callback_;
 
@@ -284,6 +321,7 @@ public:
     // 工作线程
     void threadCtrl_rtspClient();
     void threadRecv_originPull();
+    void sendOriginRtcpRR();   // 周期性向源发送 RTCP RR（多数相机/中继收不到 RR 会停发 RTP）
     void threadRecv_rtspPublish(std::shared_ptr<STREAM_SESSION> session);
     void onRecvOriginRtpPkt(std::shared_ptr<RTPPacket> pkt, STREAM_SESSION& session);
     bool checkIsIdrNalu(const RTPPacket& packet, const std::string& codec);
