@@ -346,8 +346,10 @@ void sessionHandleSTUN(std::shared_ptr<STREAM_SESSION> session,
     }
 
     // ICE 连通性确认：收到 Binding Request 并回复 Response
-    // 只在初始状态(0)时升级为1，避免 keep-alive Binding Request 把 SRTP 激活(3)降级
-    if (session->state_ == SESSION_STATE::SESSION_CONNECTING) {
+    // 会话初始即为 IDLE（无人置 CONNECTING），两种状态都升级为 HANDSHAKING，
+    // 否则 ICE 线程的 DTLS 超时（要求 state>=HANDSHAKING）永不武装
+    if (session->state_ == SESSION_STATE::SESSION_IDLE ||
+        session->state_ == SESSION_STATE::SESSION_CONNECTING) {
         session->state_ = SESSION_STATE::SESSION_HANDSHAKING;
         dtls_start = std::chrono::steady_clock::now();  // 开始 DTLS 握手计时
     }

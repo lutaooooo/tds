@@ -15,6 +15,10 @@
 #include <functional>
 #include <cerrno>
 #include <logger.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 // Windows 下将 UTF-8 路径转为宽字符（std::ofstream 的 string 重载使用系统 locale，中文路径需 wchar_t 重载）
 #ifdef _WIN32
@@ -101,6 +105,13 @@ void StreamNode::addToRtpBuffer(std::shared_ptr<RTPPacket> pPkt)
     }
 }
 
+// H.265 随机访问点 NAL 类型（RFC 7798）：BLA(16-18)/IDR(19,20)/CRA(21)。
+// 监控编码器常用 CRA 作为 GOP 边界，只认 IDR 会导致关键帧缓存永远不完整、
+// 新会话无限等待起播、PLI 兜底失效（黑屏卡死）
+static bool isH265RandomAccessNal(uint8_t nalType) {
+    return nalType >= NAL_TYPE_H265_BLA_W_LP && nalType <= NAL_TYPE_H265_CRA;
+}
+
 bool StreamNode::checkIsIdrNalu(const RTPPacket& packet, const std::string& codec) {
     bool isIdrNalu = false;
     if (packet.payload.empty()) {
@@ -114,13 +125,13 @@ bool StreamNode::checkIsIdrNalu(const RTPPacket& packet, const std::string& code
             return isIdrNalu;
         }
         uint8_t nalType = (packet.payload[0] >> 1) & 0x3F;
-        if (nalType == NAL_TYPE_H265_IDR_W_RADL || nalType == NAL_TYPE_H265_IDR_N_LP) {
+        if (isH265RandomAccessNal(nalType)) {
             isIdrNalu = true;
         }
         else if (nalType == NAL_TYPE_H265_FU && packet.payload.size() > 2) {
             // H.265 FU: [FU indicator(2B)][FU header(1B)]，FU header 低 6 位是 NAL type
             uint8_t fuNalType = packet.payload[2] & 0x3F;
-            if (fuNalType == NAL_TYPE_H265_IDR_W_RADL || fuNalType == NAL_TYPE_H265_IDR_N_LP) {
+            if (isH265RandomAccessNal(fuNalType)) {
                 isIdrNalu = true;
             }
         }
@@ -133,7 +144,7 @@ bool StreamNode::checkIsIdrNalu(const RTPPacket& packet, const std::string& code
                 off += 2;
                 if (L == 0 || off + L > packet.payload.size()) break;
                 uint8_t subNalType = (packet.payload[off] >> 1) & 0x3F;
-                if (subNalType == NAL_TYPE_H265_IDR_W_RADL || subNalType == NAL_TYPE_H265_IDR_N_LP) {
+                if (isH265RandomAccessNal(subNalType)) {
                     isIdrNalu = true;
                     break;
                 }
@@ -351,9 +362,40 @@ void StreamNode::sendRTPPacketToClients(const RTPPacket& packet) {
         // 取 1180 可保证叠加 SRTP 标签后在标准/隧道 MTU 下均不超 1500，避免弱网大包被丢弃。
         const size_t kMaxRtpPayload = 1180;
 
-        // 关键帧最大发送间隔(ms)：超过则主动重发缓存的 IDR，限制解码卡顿的最长自愈时间，
-        // 不依赖浏览器是否发送 PLI。源端 GOP 已足够密时本逻辑不会触发。
-        const int kMaxIdrGapMs = 2000;
+        // 发送门控诊断：每 5 秒汇总一次（进包/转发/各门控丢弃/关键帧缓存状态）
+        dtlsState->dbg_pkts++;
+        if (packet.isIdrNalu) dtlsState->dbg_idr++;
+        {
+            auto now2 = std::chrono::steady_clock::now();
+            if (dtlsState->dbg_last_log.time_since_epoch().count() == 0)
+                dtlsState->dbg_last_log = now2;
+            if (std::chrono::duration<double>(now2 - dtlsState->dbg_last_log).count() >= 5.0) {
+                bool kfC = false; size_t kfN = 0;
+                {
+                    std::lock_guard<std::mutex> lk(keyframe_cache_mutex_);
+                    kfC = keyframe_cache_.complete;
+                    kfN = keyframe_cache_.pkts.size();
+                }
+                LOG("[WebRTC][diag] fd=%d pkts=%llu fwd=%llu dropNoKey=%llu dropMid=%llu idr=%llu "
+                    "firstSend=%d kfComplete=%d kfN=%zu vps=%d sps=%d pps=%d",
+                    (int)session->rtp_socket,
+                    (unsigned long long)dtlsState->dbg_pkts, (unsigned long long)dtlsState->dbg_fwd,
+                    (unsigned long long)dtlsState->dbg_drop_nokey, (unsigned long long)dtlsState->dbg_drop_mid,
+                    (unsigned long long)dtlsState->dbg_idr,
+                    (int)session->is_first_send_, (int)kfC, kfN,
+                    (int)!session->vps.empty(), (int)!session->sps.empty(), (int)!session->pps.empty());
+                dtlsState->dbg_last_log = now2;
+                dtlsState->dbg_pkts = 0; dtlsState->dbg_fwd = 0;
+                dtlsState->dbg_drop_nokey = 0; dtlsState->dbg_drop_mid = 0;
+                dtlsState->dbg_idr = 0;
+            }
+        }
+
+        // 关键帧最大发送间隔(ms)：超过则置位待重发标志（在下一个帧边界执行重发），
+        // 作为"源流长时间无关键帧通过"的自愈兜底，不依赖浏览器是否发送 PLI。
+        // 必须 >> 正常 GOP：阈值小于 GOP 的健康流会被周期性注入冗余关键帧
+        // （旧值 2000ms 在 GOP>2s 的流上正是"画面每 2 秒跳变一次"的来源之一）
+        const int kMaxIdrGapMs = 10000;
 
         // 发送一个已构建好的 RTP 包（rtp[0..1] 含 V/PT/marker，rtp[4..11] 含 ts/ssrc 已填）：
         // 在此填入 per-session 序列号、SRTP 加密并发送，随后序列号自增。
@@ -362,6 +404,7 @@ void StreamNode::sendRTPPacketToClients(const RTPPacket& packet) {
             rtp[2] = (dtlsState->local_seq >> 8) & 0xFF;
             rtp[3] = dtlsState->local_seq & 0xFF;
             dtlsState->local_seq++;
+            dtlsState->dbg_fwd++;
             auto srtpPkt = SrptProtect::protect(srtpCtx, rtp);
             if (srtpPkt.empty()) return;
 
@@ -612,6 +655,20 @@ void StreamNode::sendRTPPacketToClients(const RTPPacket& packet) {
             sendNalu(nal, ts, false);
         };
 
+        // 在 IDR 帧前发送参数集（H.264: SPS/PPS；H.265: VPS/SPS/PPS）。
+        // 依赖带内参数集初始化解码器的浏览器，IDR 前缺失参数集会直接花屏
+        auto sendParamSetsBeforeIdr = [&](uint32_t ts) {
+            if (isH265) {
+                if (!session->vps.empty()) {
+                    sendSingleNalRtp(session->vps, ts);
+                } else {
+                    LOG("[WebRTC] WARNING: H265 IDR frame without VPS");
+                }
+            }
+            if (!session->sps.empty()) sendSingleNalRtp(session->sps, ts);
+            if (!session->pps.empty()) sendSingleNalRtp(session->pps, ts);
+        };
+
         // 重发缓存的关键帧（H.264: SPS+PPS+IDR 分片；H.265: VPS+SPS+PPS+IDR 分片）。
         // 缓存的是相机原始 RTP 包（含 12B 头），
         // 需解析出 NALU 后按安全 MTU 重新分片发送，避免大 IDR 包在弱网被 MTU 丢弃。
@@ -700,25 +757,28 @@ void StreamNode::sendRTPPacketToClients(const RTPPacket& packet) {
             }
         };
 
-        // 响应浏览器 PLI/FIR：ICE 线程检测到关键帧请求后置位，转发线程在此重发关键帧。
-        // 节流：刚打开时浏览器常连续发多次 PLI，距上次关键帧发送不足 300ms 时不重复
-        // 重发整个 IDR 帧（保留标志，下个包再试），避免 PLI 风暴导致关键帧流量暴涨
+        // 响应浏览器 PLI/FIR：消费请求但【不在此处立即重发】——此刻正处理的包
+        // 位于某个活帧中间，把整个缓存关键帧爆发（几十个包）插进来会割裂该帧：
+        // 前半段失去 E/marker、后半段失去 S 起始，浏览器 PacketBuffer 组帧链
+        // 被阻塞，实测表现为画面只有重发的关键帧在跳变、其余时间完全冻结。
+        // 改为置 resend_pending_，在下一个活帧的帧边界统一执行（帧对齐插入）。
+        // 节流：距上次关键帧发送不足 300ms 时保留请求标志稍后消费，
+        // 避免 PLI 风暴导致关键帧流量暴涨
         if (dtlsState->request_keyframe_resend_) {
             if (now_steady - dtlsState->last_idr_sent_time_ >= std::chrono::milliseconds(300)) {
                 dtlsState->request_keyframe_resend_ = false;
-                resendKeyframe();
-                dtlsState->last_idr_sent_time_ = now_steady;
-                // LOG("[WebRTC] keyframe resend triggered by client feedback");
+                dtlsState->resend_pending_ = true;
             }
-            // 距上次发送不足 300ms：保留标志，下个包再响应
         }
 
-        // 新会话首次发送：SPS + PPS + 缓存的关键帧 RTP 数据。
-        // 置于周期重发之前：首次发送会刷新 last_idr_sent_time_，
-        // 使同一包不再触发周期重发（否则首包会连续重发 2 次整个关键帧）。
-        // 缓存就绪（完整 IDR 已缓存）时立即补发关键帧加速出图；
-        // 缓存未就绪时不消费首次标记，并丢弃非 IDR 包，
-        // 避免浏览器在无参考帧时解码花屏（首帧退化为等下一个 IDR）
+        // 帧边界判定：isLastIdrNalu==false 表示本包是某个新帧的第一包
+        const bool isNewFrameStart = (packet.isLastIdrNalu == false);
+        bool burstSentThisPacket = false;
+
+        // 新会话首次发送：缓存的关键帧（含参数集）必须落在帧边界上。
+        // 帧中间到达时丢弃本包（半帧对浏览器组帧无意义），等下一个帧首再起播。
+        // 缓存就绪（完整 IDR 已缓存）时在帧首补发关键帧加速出图；
+        // 缓存未就绪时丢弃非 IDR 包，避免浏览器在无参考帧时解码花屏
         if (session->is_first_send_) {
             bool kfReady = false;
             {
@@ -761,41 +821,57 @@ void StreamNode::sendRTPPacketToClients(const RTPPacket& packet) {
             }
             
             if (!kfReady && !packet.isIdrNalu) {
+                dtlsState->dbg_drop_nokey++;
                 continue;  // 无参考帧可发，丢弃非关键帧，等下一个 IDR
             }
+            if (!isNewFrameStart) {
+                dtlsState->dbg_drop_mid++;
+                continue;  // 帧中间到达：丢弃本包，等下一个帧边界再首次发送
+            }
             session->is_first_send_ = false;
-            // 距上次关键帧发送 <300ms 说明本包已由 PLI/FIR 分支重发过，
-            // 只消费首次标记，不重复重发整个 IDR 帧
-            if (kfReady && now_steady - dtlsState->last_idr_sent_time_ >= std::chrono::milliseconds(300)) {
+            if (kfReady) {
                 resendKeyframe();
                 dtlsState->last_idr_sent_time_ = now_steady;
+                burstSentThisPacket = true;
+                // 本帧首已同步重发过缓存关键帧，撤销可能存在的待重发标记
+                dtlsState->resend_pending_ = false;
                 LOG("first send: sps/pps + keyframe for session");
             }
-        }
-        // 主动重发（仅非首次发送的会话）：距上次发送关键帧超过阈值即重发缓存 IDR。
-        // last_idr_sent_time_ 在每次关键帧发送（PLI 响应/首次发送/IDR 帧到达）时刷新，
-        // 正常流下不触发；仅在 2s 内无任何关键帧（弱网丢 IDR）时兜底
-        else if (now_steady - dtlsState->last_idr_sent_time_ >= std::chrono::milliseconds(kMaxIdrGapMs)) {
-            resendKeyframe();
-            dtlsState->last_idr_sent_time_ = now_steady;
-            // LOG("[WebRTC] periodic keyframe resend (gap>%dms)", kMaxIdrGapMs);
-        }
-        // 每个IDR之前发送参数集（H.264: SPS/PPS；H.265: VPS/SPS/PPS）。
-        // 注意：last_idr_sent_time_ 刷新在参数集是否为空之前——
-        // 相机 RTP 流不带参数集包（仅 SDP sprop 提供）时，IDR 帧到达同样算关键帧已发送，
-        // 否则周期重发会在每个 IDR 帧上再叠加一次完整重发（关键帧流量翻倍）
-        else if (packet.isIdrNalu && packet.isLastIdrNalu == false) {
-            if (isH265) {
-                if (!session->vps.empty()) {
-                    sendSingleNalRtp(session->vps, packet.timestamp);
-                } else {
-                    LOG("[WebRTC] WARNING: H265 IDR frame without VPS");
-                }
+            else if (packet.isIdrNalu && packet.isLastIdrNalu == false) {
+                // 缓存未就绪、但本包是 live IDR 的帧首：参数集必须补在 IDR 前，
+                // 否则首个 IDR 无带内参数集，不认 SDP sprop 的浏览器无法初始化
+                // 解码器（实测 Chrome H265 会持续 PLI 拿不到关键帧、零解码）
+                sendParamSetsBeforeIdr(packet.timestamp);
+                dtlsState->last_idr_sent_time_ = now_steady;
+                LOG("first send: params + live keyframe (cache incomplete)");
             }
-            if (!session->sps.empty()) sendSingleNalRtp(session->sps, packet.timestamp);
-            if (!session->pps.empty()) sendSingleNalRtp(session->pps, packet.timestamp);
-            dtlsState->last_idr_sent_time_ = now_steady;
-            // LOG("send sps/pps");
+        }
+        else {
+            // 主动重发兜底：距上次关键帧发送超过阈值（10s）说明源流长时间
+            // 无关键帧通过（弱网丢 IDR / CRA 漏检），置位待帧边界执行。
+            // 注意不能太小：GOP 大于阈值的健康流会被周期性插入冗余关键帧，
+            // 旧行为（2s）正是"画面每 2 秒跳一次"的直接来源之一
+            if (now_steady - dtlsState->last_idr_sent_time_ >= std::chrono::milliseconds(kMaxIdrGapMs)) {
+                dtlsState->resend_pending_ = true;
+                dtlsState->last_idr_sent_time_ = now_steady;  // 防止逐包重复置位
+            }
+            // 帧边界执行待重发（含 PLI 请求与兜底）：参数集 + 缓存关键帧
+            if (isNewFrameStart && dtlsState->resend_pending_) {
+                dtlsState->resend_pending_ = false;
+                resendKeyframe();
+                dtlsState->last_idr_sent_time_ = now_steady;
+                burstSentThisPacket = true;
+                // LOG("[WebRTC] keyframe resend at frame boundary");
+            }
+            // 每个IDR之前发送参数集（H.264: SPS/PPS；H.265: VPS/SPS/PPS），
+            // 与重发爆发互斥（爆发内已含参数集）。
+            // 注意：last_idr_sent_time_ 刷新在参数集是否为空之前——
+            // 相机 RTP 流不带参数集包（仅 SDP sprop 提供）时，IDR 帧到达同样算关键帧已发送，
+            // 否则周期重发会在每个 IDR 帧上再叠加一次完整重发（关键帧流量翻倍）
+            else if (packet.isIdrNalu && packet.isLastIdrNalu == false && !burstSentThisPacket) {
+                sendParamSetsBeforeIdr(packet.timestamp);
+                dtlsState->last_idr_sent_time_ = now_steady;
+            }
         }
 
         // 重新分片发送本帧负载（安全 MTU，解决弱网大包被丢弃导致的冻结/花屏）
@@ -959,30 +1035,73 @@ void StreamNode::recordRTPPacket(std::shared_ptr<RTPPacket> packet) {
     std::lock_guard<std::recursive_mutex> lock(rec_mutex_);
     if (!rec_ctrl_.recording) return;  // 双重检查：锁获取期间 recording 可能已被 stopRecord 置 false
     if (rec_ctrl_.firstWrite && !rec_ctrl_.preRecordingDone) {
-        //从rtp_buffer_取出rec_ctrl_.preSeconds的数据并录制（仅一次）
+        // 首写时从 rtp_buffer_ 一次性回溯预录数据。
+        // 回溯起点取「preSeconds 时间窗最旧包」与「最近一个关键帧起始包」中更旧者：
+        // 录像文件必须以关键帧开头（writeNALtoFile 的 firstWrite 门控会丢弃关键帧前
+        // 的一切），否则录制窗口内不含关键帧时（H265 长 GOP 相机 + 录制时长短）
+        // 一个 NAL 都写不出，产出 0 字节文件。
+        // 关键帧比时间窗更旧时按时间窗回溯（维持长预录语义，多余非关键帧由门控丢弃）。
         std::vector<std::shared_ptr<RTPPacket>> pre_packets;
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             uint32_t _clock = (clock_rate_ > 0) ? static_cast<uint32_t>(clock_rate_) : 90000u;
-            for (auto it = rtp_buffer_.rbegin(); it != rtp_buffer_.rend(); ++it) {
-                if (packet->timestamp - (*it)->timestamp <= static_cast<uint64_t>(rec_ctrl_.preSeconds) * _clock) {
-                    pre_packets.push_back(*it);
+            uint64_t window = static_cast<uint64_t>(rec_ctrl_.preSeconds) * _clock;
+            const size_t bufSize = rtp_buffer_.size();
+
+            // 时间窗最旧包的正向下标（新→旧扫描中最后一个仍落在窗口内的包）
+            size_t winBegin = bufSize;
+            for (size_t i = bufSize; i > 0; i--) {
+                auto& p = rtp_buffer_[i - 1];
+                if (!p) continue;
+                if (packet->timestamp - p->timestamp <= window) winBegin = i - 1;
+                else break;
+            }
+
+            // 最近一个关键帧（含分片帧）起始包的正向下标：
+            // 新→旧扫描先命中关键帧任意分片，再走到帧头（isIdrNalu 变假或时间戳变化）
+            size_t keyBegin = bufSize;
+            bool haveKey = false;
+            uint32_t keyTs = 0;
+            for (size_t i = bufSize; i > 0; i--) {
+                auto& p = rtp_buffer_[i - 1];
+                if (!p) continue;
+                if (!haveKey) {
+                    if (p->isIdrNalu) { haveKey = true; keyTs = p->timestamp; keyBegin = i - 1; }
+                }
+                else if (!p->isIdrNalu || p->timestamp != keyTs) {
+                    break;  // 已越过关键帧帧头
                 }
                 else {
-                    break;
+                    keyBegin = i - 1;
                 }
             }
+
+            size_t begin = bufSize;
+            if (haveKey) {
+                begin = (winBegin < keyBegin) ? winBegin : keyBegin;
+            }
+            else if (winBegin < bufSize) {
+                // 缓冲内无关键帧（GOP 超过缓冲窗口）：退回纯时间窗回溯，
+                // 首个关键帧到达前仍无输出，记录警告便于定位
+                begin = winBegin;
+                LOG("[录像] tag=%s: 预录回溯范围内无关键帧，文件将在下一个关键帧处才有数据",
+                    config_.tag.c_str());
+            }
+
+            for (size_t i = begin; i < bufSize; i++) {
+                if (rtp_buffer_[i]) pre_packets.push_back(rtp_buffer_[i]);
+            }
         }
-        for (auto it = pre_packets.rbegin(); it != pre_packets.rend(); ++it) {
-            if (!(*it)) continue;  // 防御：rtp_buffer_ 异常情况下跳过空指针
+        for (auto& p : pre_packets) {
+            if (!p) continue;  // 防御：rtp_buffer_ 异常情况下跳过空指针
             // 预录包同样计入媒体时长范围（文件里确实包含预录内容）
             if (!rec_ctrl_.has_first_ts_) {
-                rec_ctrl_.first_rtp_ts_ = (*it)->timestamp;
+                rec_ctrl_.first_rtp_ts_ = p->timestamp;
                 rec_ctrl_.has_first_ts_ = true;
             }
-            rec_ctrl_.last_rtp_ts_ = (*it)->timestamp;
+            rec_ctrl_.last_rtp_ts_ = p->timestamp;
             std::lock_guard<std::mutex> lock(record_queue_mutex_);
-            record_queue_.push(*it);
+            record_queue_.push(p);
         }
         rec_ctrl_.preRecordingDone = true;
     }
@@ -1128,7 +1247,9 @@ void StreamNode::writeRTPPacketToFile(std::shared_ptr<RTPPacket> pPkt, std::ofst
 // 录像独立 I/O 线程：从队列取包，批量写盘，常驻文件句柄
 void StreamNode::threadRec_h264File() {
     //open record file
-    std::ofstream ofs; 
+    std::ofstream ofs;
+    LOG("[StreamServer]record io thread start, path=%s, empty=%d",
+        rec_ctrl_.path.c_str(), rec_ctrl_.path.empty());
     if (!rec_ctrl_.path.empty()) {
 #ifdef _WIN32
         ofs.open(pathToWide(rec_ctrl_.path), std::ios::binary | std::ios::app);
@@ -1142,6 +1263,9 @@ void StreamNode::threadRec_h264File() {
         else {
             LOG("[StreamServer]start record,open record file success," + rec_ctrl_.path);
         }
+    }
+    else {
+        LOG("[error][StreamServer]record io thread: path is empty, skip open");
     }
 
     std::vector<std::shared_ptr<RTPPacket>> batch;
@@ -1168,8 +1292,33 @@ void StreamNode::threadRec_h264File() {
         batch.clear();
     }
 
+    // 诊断：循环结束后、close 之前检查
+    LOG("[录像] io loop exited, ofs good=%d, tellp=%lld",
+        (bool)ofs, (long long)ofs.tellp());
     ofs.close();
-    LOG("[StreamServer]stop record,close record file," + rec_ctrl_.path + ",nal count=" + std::to_string(rec_ctrl_.nalCount));
+    // fsync：确保内核缓冲区的数据落盘，避免后续异步 remux 读到 0 字节
+    // （Windows 下必须用宽字符路径：tag 含中文时 CreateFileA 打不开文件）
+    {
+#ifdef _WIN32
+        HANDLE h = CreateFileW(pathToWide(rec_ctrl_.path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) { FlushFileBuffers(h); CloseHandle(h); }
+#else
+        int fd = open(rec_ctrl_.path.c_str(), O_RDONLY);
+        if (fd >= 0) { fsync(fd); close(fd); }
+#endif
+    }
+    // 诊断：检查文件实际大小（同样必须宽字符路径，否则中文路径误报 0）
+    {
+#ifdef _WIN32
+        std::ifstream check(pathToWide(rec_ctrl_.path), std::ios::binary | std::ios::ate);
+#else
+        std::ifstream check(rec_ctrl_.path, std::ios::binary | std::ios::ate);
+#endif
+        size_t sz = check ? static_cast<size_t>(check.tellg()) : 0;
+        LOG("[StreamServer]stop record,close record file," + rec_ctrl_.path
+            + ",nal count=" + std::to_string(rec_ctrl_.nalCount)
+            + ",file size=" + std::to_string(sz));
+    }
 }
 
 // 解析 slice_header 首个字段 first_mb_in_slice（Exp-Golomb 无符号），
@@ -1310,4 +1459,14 @@ void StreamNode::writeNALtoFile(uint8_t nal_type, char* nal, size_t size, std::o
     ofs.write((const char*)start_code, sizeof(start_code));
     ofs.write((const char*)nal, size);
     rec_ctrl_.nalCount++;
+    if (!ofs) {
+        LOG("[error][录像] tag=%s: write failed at nal #%zu, path=%s",
+            config_.tag.c_str(), rec_ctrl_.nalCount, rec_ctrl_.path.c_str());
+    }
+    // 诊断：首个 NAL 写入后检查文件写入位置
+    if (rec_ctrl_.nalCount == 1) {
+        auto pos = ofs.tellp();
+        LOG("[录像] tag=%s: first NAL written, tellp=%lld, nal size=%zu",
+            config_.tag.c_str(), (long long)pos, size);
+    }
 }

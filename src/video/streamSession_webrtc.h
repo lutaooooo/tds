@@ -45,6 +45,21 @@ struct SessionDtlsState {
     // 转发线程在发送循环中消费并重发缓存的关键帧（避免 ICE 线程并发发 SRTP）
     std::atomic<bool> request_keyframe_resend_{false};
 
+    // 关键帧重发待执行标志：转发线程把 PLI 请求与周期兜底统一转入此标志，
+    // 在下一个活帧的帧边界（isLastIdrNalu==false 的包）执行。
+    // 不能在活帧中间插入整个缓存关键帧爆发：会割裂当前帧（前半无 E/marker、
+    // 后半无 S 起始），浏览器 PacketBuffer 组帧链被阻塞，表现为只有重发的
+    // 关键帧能出画（画面按重发周期跳变）、其余时间冻结。
+    std::atomic<bool> resend_pending_{false};
+
+    // 发送门控诊断计数器（每 5 秒汇总输出一次）
+    uint64_t dbg_pkts = 0;        // 进入发送循环的包数
+    uint64_t dbg_fwd = 0;         // 实际 sendNalu 转发的包数
+    uint64_t dbg_drop_nokey = 0;  // 首帧门控丢弃（缓存未就绪且非关键帧）
+    uint64_t dbg_drop_mid = 0;    // 首帧门控丢弃（帧中间到达）
+    uint64_t dbg_idr = 0;         // 关键帧包数
+    std::chrono::steady_clock::time_point dbg_last_log{};
+
     // NACK 重传缓存：转发线程写入已加密的 SRTP 字节，ICE 线程收到 NACK 后读取并原样重发。
     // 重发的是密文，不触碰 srtp_ctx/local_seq，无并发风险；mutex 仅保护缓冲本身。
     std::vector<RtxCachedPacket> rtx_buf_;
