@@ -6109,6 +6109,9 @@ bool TDB::InsertDeJsonStr(std::string strTag, DB_TIME stTime, std::string& sDe, 
 	if (!m_enableDB)
 		return false;
 
+	//电梯监测报警判定(de-json落库处)
+	emAlmOnInsertDe(strTag, stTime.toStr(), sDe);
+
 	tagTreeAdd(strTag); // register the tag into the tag tree (persist only when newly added)
 
 	if (buffered && m_enableInsertBuff) {
@@ -6972,6 +6975,8 @@ void TDB::rpc_db_update(yyjson_val* params, std::string& rlt, std::string& err, 
 
 	if (updateRet == 0) {
 		rlt = JSON_STR_VAL("ok");
+		//电梯监测报警判定(IAS分析结果max落库处)
+		emAlmOnUpdate(tag, time, updateVal, updateFile);
 	}
 	else {
 		err = JSON_STR_VAL("update fail,code: " + std::to_string(updateRet));
