@@ -363,40 +363,50 @@ void StreamServer::idleMonitorLoop() {
 	while (m_idleMonitorRunning_) {
 		std::this_thread::sleep_for(std::chrono::seconds(5));
 
-		std::lock_guard<std::mutex> lock(nodeLock_);
-		auto now = std::chrono::steady_clock::now();
+		// 锁外执行 sn->stop()：stop 会 join 各工作线程，耗时可达秒级，
+		// 持 nodeLock_ 停节点会卡住 playWebRtc/openStream 等所有节点表查询
+		// （对齐 closeStream 的"锁内摘表、锁外停止"做法）
+		std::vector<std::shared_ptr<StreamNode>> nodesToStop;
+		{
+			std::lock_guard<std::mutex> lock(nodeLock_);
+			auto now = std::chrono::steady_clock::now();
 
-		for (auto& pair : m_mapStreamNodes) {
-			const std::string& streamUrl = pair.first;
-			std::shared_ptr<StreamNode> sn = pair.second;
-			if (!sn) continue;
+			for (auto& pair : m_mapStreamNodes) {
+				const std::string& streamUrl = pair.first;
+				std::shared_ptr<StreamNode> sn = pair.second;
+				if (!sn) continue;
 
-			// 只监控 ondemand 模式且状态为 streaming 的流
-			if (sn->config_.srcStreamFetch != "ondemand") continue;
-			if (sn->session_origin_.state_ != SESSION_STATE::SESSION_STREAMING) {
-				m_idleTrackMap_.erase(streamUrl);
-				continue;
-			}
+				// 只监控 ondemand 模式且状态为 streaming 的流
+				if (sn->config_.srcStreamFetch != "ondemand") continue;
+				if (sn->session_origin_.state_ != SESSION_STATE::SESSION_STREAMING) {
+					m_idleTrackMap_.erase(streamUrl);
+					continue;
+				}
 
-			if (sn->hasWorkToDo()) {
-				m_idleTrackMap_.erase(streamUrl);
-			}
-			else {
-				auto it = m_idleTrackMap_.find(streamUrl);
-				if (it == m_idleTrackMap_.end()) {
-					m_idleTrackMap_[streamUrl] = now;
+				if (sn->hasWorkToDo()) {
+					m_idleTrackMap_.erase(streamUrl);
 				}
 				else {
-					int64_t elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-						now - it->second).count();
-					if (elapsed >= m_streamIdleTimeoutSec) {
-						LOG("[StreamServer] ondemand流 %s 已空闲 %lld 秒（超时=%d秒），自动关闭源连接",
-							streamUrl.c_str(), elapsed, m_streamIdleTimeoutSec);
-						sn->stop();
-						m_idleTrackMap_.erase(streamUrl);
+					auto it = m_idleTrackMap_.find(streamUrl);
+					if (it == m_idleTrackMap_.end()) {
+						m_idleTrackMap_[streamUrl] = now;
+					}
+					else {
+						int64_t elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+							now - it->second).count();
+						if (elapsed >= m_streamIdleTimeoutSec) {
+							LOG("[StreamServer] ondemand流 %s 已空闲 %lld 秒（超时=%d秒），自动关闭源连接",
+								streamUrl.c_str(), elapsed, m_streamIdleTimeoutSec);
+							nodesToStop.push_back(sn);
+							m_idleTrackMap_.erase(streamUrl);
+						}
 					}
 				}
 			}
+		}
+
+		for (auto& sn : nodesToStop) {
+			sn->stop();
 		}
 	}
 }
