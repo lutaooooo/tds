@@ -775,7 +775,10 @@ bool TDS_imp::run(string cmdline) {
 		//::db.m_dbFmt.deListName = db_Fmt.deListName == "" ? tds->conf->getStr("deListName", "db.json") : db_Fmt.deListName;
 		::db.m_dbFmt.deListName = deListName == "" ? db_Fmt.deListName : deListName;
 		::db.m_dbFmt.curveIdxListName  = db_Fmt.curveIdxListName  == "" ? tds->conf->getStr("curveIdxListName", "db.curve.json") : db_Fmt.curveIdxListName;
-		::db.m_dbFmt.curveDeNameSuffix = db_Fmt.curveDeNameSuffix == "" ? tds->conf->getStr("curveDeNameSuffix", ".curve.json") : db_Fmt.curveDeNameSuffix;
+		//显式配置的curveDeNameSuffix优先于自动探测结果(探测依赖目录遍历顺序,不可靠)
+		string confCurveSuffix = tds->conf->getStr("curveDeNameSuffix", "");
+		::db.m_dbFmt.curveDeNameSuffix = confCurveSuffix != "" ? confCurveSuffix :
+			(db_Fmt.curveDeNameSuffix == "" ? tds->conf->getStr("curveDeNameSuffix", ".curve.json") : db_Fmt.curveDeNameSuffix);
 		::db.m_dbFmt.deItemKey_value   = db_Fmt.deItemKey_value   == "" ? tds->conf->getStr("deItemKey_value", "val") : db_Fmt.deItemKey_value;
 
 		::db.Open(tds->conf->dbPath, g_getTagsByTagSelector, prj.m_name);
