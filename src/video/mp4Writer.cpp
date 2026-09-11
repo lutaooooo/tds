@@ -517,7 +517,7 @@ static bool parseAnnexB(const std::string& path,
     ifs.seekg(0, std::ios::beg);
 
     if (fileSize < 4) {
-        LOG("[MP4] .h265/.h264 file too small: %zu bytes", fileSize);
+        LOG("[MP4] .h265/.h264 file too small: %zu bytes, path: %s", fileSize, path.c_str());
         return false;
     }
 

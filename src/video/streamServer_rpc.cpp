@@ -648,6 +648,13 @@ bool StreamServer::rpc_startRecord(yyjson_val* params, RPC_RESP& rpcResp, RPC_SE
 			rc->rec_ctrl_.first_rtp_ts_ = 0;
 			rc->rec_ctrl_.last_rtp_ts_ = 0;
 			rc->rec_ctrl_.has_first_ts_ = false;
+			// 计数与关键帧状态必须复位：跨录像残留会使文件头参数集注入失效
+			// （isIdrNal 残留 true 时首个 IDR 不再触发 VPS/SPS/PPS 注入），
+			// 并使 nalCount/frame_count/时长统计串场（表现为两次录像 nalCount 相同）
+			rc->rec_ctrl_.nalCount = 0;
+			rc->rec_ctrl_.frame_count = 0;
+			rc->rec_ctrl_.isIdrNal = false;
+			rc->rec_ctrl_.isLastIdrNal = false;
 			DB_TIME now; now.setNow();
 			std::string ts = str::format("%04d%02d%02d_%02d%02d%02d",
 				now.wYear, now.wMonth, now.wDay,
@@ -720,8 +727,14 @@ bool StreamServer::rpc_stopRecord(yyjson_val* params, RPC_RESP& rpcResp, RPC_SES
 			rc->flushRecordBuffer();
 
 			// 诊断：flush 后立即检查原文件大小
+			// 注意必须用宽字符路径：tag 含中文时窄字符路径打不开，
+			// 会把健康文件误报成 file size=0
 			{
+#ifdef _WIN32
+				std::ifstream chk(str::utf8_to_utf16(rc->rec_ctrl_.path), std::ios::binary | std::ios::ate);
+#else
 				std::ifstream chk(rc->rec_ctrl_.path, std::ios::binary | std::ios::ate);
+#endif
 				size_t sz = chk ? static_cast<size_t>(chk.tellg()) : 0;
 				LOG("[录像] flushRecordBuffer done, path=%s, file size=%zu, nal count=%zu, codec=%s",
 					rc->rec_ctrl_.path.c_str(), sz, rc->rec_ctrl_.nalCount, recCodec.c_str());
