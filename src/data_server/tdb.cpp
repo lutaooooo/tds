@@ -1427,7 +1427,12 @@ bool TDB::AsynInsertByDeType(std::string strTag, std::string& sDe, const std::st
 	param->de = sDe;
 	param->deType = sDeType;
 	param->tag = strTag;
-	param->time = *time;
+	if (time) {
+		param->time = *time;
+	}
+	else {
+		param->time = TIME_OPT::now();
+	}
 	param->withDeFile = true;
 	m_csInsertAsynBuff.lock();
 	m_insertAsynBuff.push_back(param);
