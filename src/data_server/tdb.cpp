@@ -1119,7 +1119,7 @@ void diskWriteThread(TDB* pDB) {
 				pDB->InsertDeJsonStr(p->tag, p->time, p->de, p->buffered);
 			delete p;
 		}
-		Sleep(50);
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
 }
 
