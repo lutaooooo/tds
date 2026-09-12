@@ -1102,21 +1102,21 @@ bool shouldErase(const std::pair<std::string, FILE_BUFF*>& pair) {
 	return false;
 }
 
-void diskWriteThread() {
+void diskWriteThread(TDB* pDB) {
 	while (1) {
 		std::vector<INSERT_PARAM*> vecInsert;
-		db.m_csInsertAsynBuff.lock();
-		vecInsert.swap(db.m_insertAsynBuff);
-		db.m_csInsertAsynBuff.unlock();
+		pDB->m_csInsertAsynBuff.lock();
+		vecInsert.swap(pDB->m_insertAsynBuff);
+		pDB->m_csInsertAsynBuff.unlock();
 
 		for (int i = 0; i < vecInsert.size(); i++)
 		{
 			INSERT_PARAM* p = vecInsert[i];
 			if (p->withDeFile) {
-				db.InsertByDeType(p->tag, p->de, p->deType, &p->time);
+				pDB->InsertByDeType(p->tag, p->de, p->deType, &p->time);
 			}
 			else
-				db.InsertDeJsonStr(p->tag, p->time, p->de, p->buffered);
+				pDB->InsertDeJsonStr(p->tag, p->time, p->de, p->buffered);
 			delete p;
 		}
 		Sleep(50);
@@ -1160,7 +1160,7 @@ TDB::TDB()
 	m_bufferTTL = 3 * 3600;
 	std::thread t(bufferManageThread, this);
 	t.detach();
-	std::thread t1(diskWriteThread);
+	std::thread t1(diskWriteThread,this);
 	t1.detach();
 }
 
