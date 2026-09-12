@@ -33,7 +33,6 @@ SOFTWARE.
 #include <stdarg.h>
 #include <mutex>
 #include <regex>
-#include "DTW.hpp"
 #include <thread>
 #include "dtwrecoge.h"
 #include <chrono>
@@ -1103,6 +1102,27 @@ bool shouldErase(const std::pair<std::string, FILE_BUFF*>& pair) {
 	return false;
 }
 
+void diskWriteThread() {
+	while (1) {
+		std::vector<INSERT_PARAM*> vecInsert;
+		db.m_csInsertAsynBuff.lock();
+		vecInsert.swap(db.m_insertAsynBuff);
+		db.m_csInsertAsynBuff.unlock();
+
+		for (int i = 0; i < vecInsert.size(); i++)
+		{
+			INSERT_PARAM* p = vecInsert[i];
+			if (p->withDeFile) {
+				db.InsertByDeType(p->tag, p->de, p->deType, &p->time);
+			}
+			else
+				db.InsertDeJsonStr(p->tag, p->time, p->de, p->buffered);
+			delete p;
+		}
+		Sleep(50);
+	}
+}
+
 void bufferManageThread(TDB* p) {
 	DB_TIME lastCheck;
 	lastCheck.setNow();
@@ -1140,6 +1160,8 @@ TDB::TDB()
 	m_bufferTTL = 3 * 3600;
 	std::thread t(bufferManageThread, this);
 	t.detach();
+	std::thread t1(diskWriteThread);
+	t1.detach();
 }
 
 std::string TDB::getPath_deFile(std::string strTag, DB_TIME stTime)
@@ -1397,6 +1419,23 @@ std::string TDB::getDeFilesFolder(std::string& deListFolder, DB_TIME& time) {
 	return s;
 }
 
+
+bool TDB::AsynInsertByDeType(std::string strTag, std::string& sDe, const std::string& sDeType, DB_TIME* time/* = nullptr*/)
+{
+	INSERT_PARAM* param = new INSERT_PARAM();
+	param->buffered = false;
+	param->de = sDe;
+	param->deType = sDeType;
+	param->tag = strTag;
+	param->time = *time;
+	param->withDeFile = true;
+	m_csInsertAsynBuff.lock();
+	m_insertAsynBuff.push_back(param);
+	m_csInsertAsynBuff.unlock();
+	return true;
+}
+
+
 bool TDB::InsertByDeType(std::string strTag, std::string& sDe, const std::string& sDeType, DB_TIME* time/* = nullptr*/)
 {
 	if (!m_enableDB)
@@ -1503,11 +1542,11 @@ bool TDB::Insert(std::string strTag, std::string& sDe, DB_TIME* time,bool buffer
 {
 	//data element with file data,write immidaitely ,deserialize de string, seperate file data into a file on disk
 	if (sDe.find("\"file\":") != std::string::npos) {
-		return InsertByDeType(strTag, sDe, "", time);
+		return AsynInsertByDeType(strTag, sDe, "", time);
 	}
 	//just append to data list
 	else
-		return InsertDeJsonStr(strTag,*time,sDe,buffered);
+		return AsynInsertDeJsonStr(strTag,*time,sDe,buffered);
 }
 
 struct DE_TEMP {
@@ -3511,55 +3550,6 @@ bool TDB::Select(DE_SELECTOR& deSel, SELECT_RLT& result) {
 							SORT_FLAG sf;
 							sf.dbFlag = sortIdx++;
 							result.rltDataSet[sf] = yyv_aes_de;
-						}
-						else if (deSel.calc == "dtw") {
-							if (pBase->size() != pCur->size()) {
-								DBLog("dtw calc use different length,%d,%d\r\n", pBase->size(), pCur->size());
-							}
-
-							size_t len = pBase->size() < pCur->size() ? pBase->size() : pCur->size();
-							double dtw = DTWDistanceFun(pCur->data(), pCur->size(), pBase->data(), pBase->size(), pBase->size() / 10);
-
-							yyjson_mut_val* yyv_dtw_de = yyjson_mut_obj(rlt_mut_doc);
-							yyjson_mut_val* yyv_time_key = yyjson_mut_strcpy(rlt_mut_doc, "time");
-							yyjson_mut_val* yyv_time_val = yyjson_mut_strcpy(rlt_mut_doc, iter.first.toStr().c_str());
-							yyjson_mut_obj_put(yyv_dtw_de, yyv_time_key, yyv_time_val);
-
-							yyjson_mut_val* yyv_val_key = yyjson_mut_strcpy(rlt_mut_doc, "val");
-							yyjson_mut_val* yyv_val_val = yyjson_mut_real(rlt_mut_doc, dtw);
-							yyjson_mut_obj_put(yyv_dtw_de, yyv_val_key, yyv_val_val);
-
-							SORT_FLAG sf;
-							sf.dbFlag = sortIdx++;
-							result.rltDataSet[sf] = yyv_dtw_de;
-						}
-						else if (deSel.calc == "dtw2") {
-							std::vector<std::vector<double>> base;
-							for (int i = 0; i < pBase->size() && i < pCur->size(); i++) {
-								std::vector<double> pt;
-								pt.push_back((*pBase)[i]);
-								base.push_back(pt);
-							}
-							std::vector<std::vector<double>> cur;
-							for (int i = 0; i < pBase->size() && i < pCur->size(); i++) {
-								std::vector<double> pt;
-								pt.push_back((*pCur)[i]);
-								cur.push_back(pt);
-							}
-							double dtw = DTW::dtw_distance_only(base, cur, 2);
-
-							yyjson_mut_val* yyv_dtw_de = yyjson_mut_obj(rlt_mut_doc);
-							yyjson_mut_val* yyv_time_key = yyjson_mut_strcpy(rlt_mut_doc, "time");
-							yyjson_mut_val* yyv_time_val = yyjson_mut_strcpy(rlt_mut_doc, iter.first.toStr().c_str());
-							yyjson_mut_obj_put(yyv_dtw_de, yyv_time_key, yyv_time_val);
-
-							yyjson_mut_val* yyv_val_key = yyjson_mut_strcpy(rlt_mut_doc, "val");
-							yyjson_mut_val* yyv_val_val = yyjson_mut_real(rlt_mut_doc, dtw);
-							yyjson_mut_obj_put(yyv_dtw_de, yyv_val_key, yyv_val_val);
-
-							SORT_FLAG sf;
-							sf.dbFlag = sortIdx++;
-							result.rltDataSet[sf] = yyv_dtw_de;
 						}
 					}
 
@@ -5861,6 +5851,18 @@ yyjson_mut_doc* TDB::convertJsonFormat(yyjson_doc* original_doc) {
 	return new_doc;
 }
 
+bool TDB::AsynInsertDeJsonStr(std::string strTag, DB_TIME stTime, std::string& sDe, bool buffered)
+{
+	INSERT_PARAM* param = new INSERT_PARAM();
+	param->buffered = buffered;
+	param->de = sDe;
+	param->tag = strTag;
+	param->time = stTime;
+	m_csInsertAsynBuff.lock();
+	m_insertAsynBuff.push_back(param);
+	m_csInsertAsynBuff.unlock();
+	return true;
+}
 
 bool TDB::InsertDeJsonStr(std::string strTag, DB_TIME stTime, std::string& sDe, bool buffered)
 {
@@ -5988,7 +5990,7 @@ bool TDB::InsertValJsonStr(std::string strTag, DB_TIME stTime, std::string& sVal
 {
 	std::string sDe = "{\n\"time\":\"" + stTime.toStr() + "\",\n\"" + m_dbFmt.deItemKey_value + "\":" + sVal + "\n}";
 
-	return InsertDeJsonStr(strTag, stTime, sDe, buffered);
+	return AsynInsertDeJsonStr(strTag, stTime, sDe, buffered);
 }
 
 #if defined(_WIN32) && _WIN32_WINNT>=0x0600 // XP system does not support the function 'SetFileInformationByHandle'.

@@ -1,4 +1,7 @@
-﻿/*
+﻿#ifndef TDS_DATA_SERVER_TDB_H
+#define TDS_DATA_SERVER_TDB_H
+
+/*
   TDB version 1.0.0
   a minimal time series database based on json files for iot
   https://gitee.com/liangtuSoft/tds.git
@@ -26,7 +29,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE  OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-#pragma once
 #include <map>
 #include <unordered_map>
 #include <set>
@@ -608,6 +610,20 @@ struct DE_BUFF {
 	std::string sDe;
 };
 
+struct INSERT_PARAM {
+	bool buffered;
+	std::string tag;
+	std::string de;
+	std::string deType;
+	bool withDeFile;
+	DB_TIME time;
+
+	INSERT_PARAM() {
+		buffered = false;
+		withDeFile = false;
+	}
+};
+
 //a data set specified by time and tag
 //key tag can be exact tag, or fuzzy tag with * to represent multi tags
 class DATA_SET {
@@ -1041,6 +1057,8 @@ public:
 	bool InsertValJsonStrBuffer(std::string strTag, std::vector<DE_BUFF>& deBuff);
 	std::unordered_map<std::string,std::vector<DE_BUFF>> m_insertBuff;
 	std::mutex m_csInsertBuff;
+	std::vector<INSERT_PARAM*> m_insertAsynBuff;  //asyn insert ,let tdb disk write thread to write
+	std::mutex m_csInsertAsynBuff;
 
 	//select
 	bool Select_Step_selectTags(DE_SELECTOR& deSel, SELECT_RLT& rlt);
@@ -1094,6 +1112,8 @@ public:
 	std::string m_confPath;
 	std::string m_currentPath;
 	fp_dbLog m_fpDBLog;
+	bool AsynInsertDeJsonStr(std::string strTag, DB_TIME stTime, std::string& sDe, bool buffered);
+	bool AsynInsertByDeType(std::string strTag, std::string& sDe, const std::string& sDeType, DB_TIME* time);
 };
 unsigned int
 tdb_base64_encode(const unsigned char* in, unsigned int inlen, char* out);
@@ -1102,3 +1122,5 @@ bool IsLeapYear(int wYear);
 int DaysInAMonth(int wYear, int wMonth);
 
 extern TDB db;
+
+#endif /* TDS_DATA_SERVER_TDB_H */
