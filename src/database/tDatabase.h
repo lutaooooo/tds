@@ -1,4 +1,4 @@
-﻿#ifndef TDS_DATABASE_TDATABASE_H
+#ifndef TDS_DATABASE_TDATABASE_H
 #define TDS_DATABASE_TDATABASE_H
 
 /*
@@ -1148,5 +1148,9 @@ int DaysInAMonth(int wYear, int wMonth);
 
 extern TDB db;
 
+//电梯监测报警记录(db/alarms/em/alarms.json)，实现在rpcHandler.cpp
+//db.update成功后/db.insert落库时回调，按位号报警值判定并追加报警记录
+void emAlmOnUpdate(const std::string& tag, const std::string& timeStr, yyjson_val* yyVal, yyjson_val* updateFile);
+void emAlmOnInsertDe(const std::string& tag, const std::string& timeStr, const std::string& sDe);
 
 #endif /* TDS_DATABASE_TDATABASE_H */

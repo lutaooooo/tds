@@ -16,6 +16,7 @@
 #include "scriptManager.h"
 #include "base64.h"
 #include <fstream>
+#include <atomic>
 #include "webSrv.h"
 #include "ioDev_camera.h"
 #include "statusServer.h"
@@ -2372,6 +2373,314 @@ void createObjRecursive(string path, OBJ* pParent) {
 	}
 }
 
+// ==================== 电梯监测报警记录(db/alarms/em/alarms.json) ====================
+//报警值配置: confPath/alm_config.json,键为归一化位号('.'->'/')
+//db.update成功/db.insert落库时(emAlmOnUpdate/emAlmOnInsertDe)按报警值判定,超限追加报警记录
+//记录格式: [{"tag":..,"time":..,"almVal":..,"maxVal":..,"file":..,"ackTime":..}]
+#define EM_ALM_MAX_RECORDS 5000
+
+static std::mutex s_csEmAlm;
+static std::map<std::string, double> s_mapEmAlmConf;
+static std::atomic<int> s_nEmAlmConf(-1);   //-1=未加载,0=无配置,>0=已配置条数
+
+static std::string emAlmNormalizeTag(const std::string& tag) {
+	std::string s = tag;
+	for (auto& c : s) { if (c == '.') c = '/'; }
+	return s;
+}
+
+static std::string emAlmRecFilePath() {
+	return tds->conf->dbPath + "/alarms/em/alarms.json";
+}
+
+static void emAlmLoadConf() {
+	s_mapEmAlmConf.clear();
+	std::string s;
+	if (fs::readFile(tds->conf->confPath + "/alm_config.json", s) && s != "") {
+		try {
+			json j = json::parse(s);
+			if (j.is_object()) {
+				for (auto it = j.begin(); it != j.end(); ++it) {
+					if (it.value().is_number()) {
+						s_mapEmAlmConf[emAlmNormalizeTag(it.key())] = it.value().get<double>();
+					}
+				}
+			}
+		}
+		catch (const std::exception&) {}
+	}
+	s_nEmAlmConf = (int)s_mapEmAlmConf.size();
+}
+
+void emAlmReloadConf() {
+	std::lock_guard<std::mutex> lock(s_csEmAlm);
+	emAlmLoadConf();
+}
+
+//查找位号报警值,未配置返回false(热路径仅一次原子读)
+static bool emAlmGetThreshold(const std::string& tag, double& val) {
+	int n = s_nEmAlmConf.load();
+	if (n == 0) return false;
+	if (n < 0) {
+		std::lock_guard<std::mutex> lock(s_csEmAlm);
+		if (s_nEmAlmConf.load() < 0) emAlmLoadConf();
+		n = s_nEmAlmConf.load();
+		if (n == 0) return false;
+	}
+	std::lock_guard<std::mutex> lock(s_csEmAlm);
+	auto it = s_mapEmAlmConf.find(emAlmNormalizeTag(tag));
+	if (it == s_mapEmAlmConf.end()) return false;
+	val = it->second;
+	return true;
+}
+
+//从记录对象提取最大值: 优先obj["max"], 其次obj["val"]["max"]
+static bool emAlmObjMax(yyjson_val* obj, double& maxVal) {
+	if (!obj || !yyjson_is_obj(obj)) return false;
+	yyjson_val* yv = yyjson_obj_get(obj, "max");
+	if (yv && yyjson_is_num(yv)) { maxVal = yyjson_get_num(yv); return true; }
+	yyjson_val* yvVal = yyjson_obj_get(obj, "val");
+	if (yvVal && yyjson_is_obj(yvVal)) {
+		yv = yyjson_obj_get(yvVal, "max");
+		if (yv && yyjson_is_num(yv)) { maxVal = yyjson_get_num(yv); return true; }
+	}
+	return false;
+}
+
+//从update参数提取最大值: 优先file参数, 其次val参数(数值或对象)
+static bool emAlmExtractMax(yyjson_val* yyVal, yyjson_val* updateFile, double& maxVal) {
+	if (emAlmObjMax(updateFile, maxVal)) return true;
+	if (yyVal) {
+		if (yyjson_is_num(yyVal)) { maxVal = yyjson_get_num(yyVal); return true; }
+		if (emAlmObjMax(yyVal, maxVal)) return true;
+	}
+	return false;
+}
+
+//从记录对象取字符串字段
+static std::string emAlmObjStr(yyjson_val* obj, const char* key) {
+	if (!obj || !yyjson_is_obj(obj)) return "";
+	yyjson_val* yv = yyjson_obj_get(obj, key);
+	if (yv && yyjson_is_str(yv)) return yyjson_get_str(yv);
+	return "";
+}
+
+static json emAlmReadRecords() {
+	json jArr = json::array();
+	std::string s;
+	if (fs::readFile(emAlmRecFilePath(), s) && s != "") {
+		try {
+			json j = json::parse(s);
+			if (j.is_array()) jArr = j;
+		}
+		catch (const std::exception&) {}
+	}
+	return jArr;
+}
+
+static void emAlmWriteRecords(json& jArr) {
+	std::string sOut = jArr.dump(2);
+	fs::createFolderOfPath(emAlmRecFilePath());
+	fs::writeFile(emAlmRecFilePath(), sOut);
+}
+
+//追加一条报警记录(需持有s_csEmAlm; 去重:位号+时间; 上限EM_ALM_MAX_RECORDS,超出删最旧)
+//返回是否实际追加了新记录
+static bool emAlmAppendRecord(json& jArr, const std::string& tag, const std::string& timeStr, double almVal, double maxVal, const std::string& file) {
+	for (auto& r : jArr) {
+		if (r.is_object() && r.value("tag", "") == tag && r.value("time", "") == timeStr) {
+			return false;
+		}
+	}
+	json r;
+	r["tag"] = tag;
+	r["time"] = timeStr;
+	r["almVal"] = almVal;
+	r["maxVal"] = maxVal;
+	r["file"] = file;
+	r["ackTime"] = "";
+	jArr.push_back(r);
+	std::sort(jArr.begin(), jArr.end(), [](const json& a, const json& b) {
+		return a.value("time", "") < b.value("time", "");
+	});
+	if (jArr.size() > EM_ALM_MAX_RECORDS) {
+		jArr.erase(jArr.begin(), jArr.begin() + (jArr.size() - EM_ALM_MAX_RECORDS));
+	}
+	emAlmWriteRecords(jArr);
+	LOG("[电梯报警] %s time=%s almVal=%g maxVal=%g", tag.c_str(), timeStr.c_str(), almVal, maxVal);
+	return true;
+}
+
+//报警产生后实时推送到已订阅的前端会话(WebSocket)
+static void emAlmNotifyFront(const std::string& tag, const std::string& timeStr, double almVal, double maxVal, const std::string& file) {
+	json jN;
+	jN["tag"] = tag;
+	jN["time"] = timeStr;
+	jN["almVal"] = almVal;
+	jN["maxVal"] = maxVal;
+	jN["file"] = file;
+	rpcSrv.notify("emAlmNotify", jN.dump());
+}
+
+//db.update成功后回调: IAS分析结果(max)落库处,即报警判定点
+void emAlmOnUpdate(const std::string& tag, const std::string& timeStr, yyjson_val* yyVal, yyjson_val* updateFile) {
+	double almVal;
+	if (!emAlmGetThreshold(tag, almVal)) return;
+	double maxVal;
+	if (!emAlmExtractMax(yyVal, updateFile, maxVal)) return;
+	if (maxVal <= almVal) return;
+	std::string timeStrRec = emAlmObjStr(updateFile, "startTime");
+	if (timeStrRec == "") timeStrRec = timeStr;
+	std::string file = emAlmObjStr(updateFile, "name");
+	std::string tagNorm = emAlmNormalizeTag(tag);
+	bool bAdded = false;
+	{
+		std::lock_guard<std::mutex> lock(s_csEmAlm);
+		json jArr = emAlmReadRecords();
+		bAdded = emAlmAppendRecord(jArr, tagNorm, timeStrRec, almVal, maxVal, file);
+	}
+	if (bAdded) emAlmNotifyFront(tagNorm, timeStrRec, almVal, maxVal, file);
+}
+
+//db.insert落库时回调
+void emAlmOnInsertDe(const std::string& tag, const std::string& timeStr, const std::string& sDe) {
+	double almVal;
+	if (!emAlmGetThreshold(tag, almVal)) return;
+	if (sDe.empty()) return;
+	yyjson_doc* doc = yyjson_read(sDe.c_str(), sDe.length(), 0);
+	if (!doc) return;
+	yyjson_val* root = yyjson_doc_get_root(doc);
+	double maxVal;
+	if (!emAlmObjMax(root, maxVal)) { yyjson_doc_free(doc); return; }
+	if (maxVal <= almVal) { yyjson_doc_free(doc); return; }
+	std::string timeStrRec = emAlmObjStr(root, "startTime");
+	if (timeStrRec == "") timeStrRec = timeStr;
+	std::string file = emAlmObjStr(root, "file");
+	yyjson_doc_free(doc);
+	std::string tagNorm = emAlmNormalizeTag(tag);
+	bool bAdded = false;
+	{
+		std::lock_guard<std::mutex> lock(s_csEmAlm);
+		json jArr = emAlmReadRecords();
+		bAdded = emAlmAppendRecord(jArr, tagNorm, timeStrRec, almVal, maxVal, file);
+	}
+	if (bAdded) emAlmNotifyFront(tagNorm, timeStrRec, almVal, maxVal, file);
+}
+
+//确认报警记录(需持有s_csEmAlm): params {all:true} 或 {items:[{tag,time},...]}
+static json emAlmAckRecords(json& params) {
+	json jArr = emAlmReadRecords();
+	TIME tNow;
+	tNow.setNow();
+	std::string sNow = tNow.toStr();
+	int nAcked = 0;
+	bool bAll = params.value("all", false);
+	if (bAll) {
+		for (auto& r : jArr) {
+			if (r.is_object() && r.value("ackTime", "") == "") { r["ackTime"] = sNow; nAcked++; }
+		}
+	}
+	else if (params.contains("items") && params["items"].is_array()) {
+		for (auto& itm : params["items"]) {
+			if (!itm.is_object()) continue;
+			std::string tag = emAlmNormalizeTag(itm.value("tag", ""));
+			std::string timeStr = itm.value("time", "");
+			for (auto& r : jArr) {
+				if (r.is_object() && r.value("tag", "") == tag && r.value("time", "") == timeStr && r.value("ackTime", "") == "") {
+					r["ackTime"] = sNow;
+					nAcked++;
+				}
+			}
+		}
+	}
+	if (nAcked > 0) emAlmWriteRecords(jArr);
+	json jRlt;
+	jRlt["acked"] = nAcked;
+	return jRlt;
+}
+
+static bool emAlmAllDigits(const std::string& s, size_t len) {
+	if (s.length() != len) return false;
+	for (char c : s) { if (c < '0' || c > '9') return false; }
+	return true;
+}
+
+//一次性回填历史报警记录: 全量扫描db目录,按位号+时间去重,幂等(需持有s_csEmAlm)
+static json emAlmBackfillScan() {
+	json jRlt;
+	jRlt["added"] = 0;
+	jRlt["total"] = 0;
+	if (s_nEmAlmConf.load() < 0) emAlmLoadConf();
+	if (s_mapEmAlmConf.empty()) {
+		jRlt["msg"] = "未设置报警值";
+		return jRlt;
+	}
+	json jArr = emAlmReadRecords();
+	//已存在记录的键集合,用于去重
+	std::set<std::string> setKeys;
+	for (auto& r : jArr) {
+		if (r.is_object()) setKeys.insert(r.value("tag", "") + "|" + r.value("time", ""));
+	}
+	std::string dbRoot = tds->conf->dbPath;
+	std::vector<fs::FILE_INFO> months;
+	fs::getFolderList(months, dbRoot);
+	int nAdded = 0;
+	for (auto& m : months) {
+		if (!emAlmAllDigits(m.name, 6)) continue;
+		std::vector<fs::FILE_INFO> days;
+		fs::getFolderList(days, dbRoot + "/" + m.name);
+		for (auto& d : days) {
+			if (!emAlmAllDigits(d.name, 2)) continue;
+			std::string datePath = m.name + "/" + d.name;
+			for (auto& kv : s_mapEmAlmConf) {
+				const std::string& tag = kv.first;
+				double almVal = kv.second;
+				std::string dbJsonPath = dbRoot + "/" + datePath + "/" + tag + "/db.json";
+				std::string s;
+				if (!fs::readFile(dbJsonPath, s) || s == "") continue;
+				json jDb;
+				try { jDb = json::parse(s); }
+				catch (const std::exception&) { continue; }
+				if (!jDb.is_array()) continue;
+				for (auto& rec : jDb) {
+					if (!rec.is_object()) continue;
+					if (!rec.contains("max") || !rec["max"].is_number()) continue;
+					double maxVal = rec["max"].get<double>();
+					if (maxVal <= almVal) continue;
+					std::string timeStr = rec.value("startTime", "");
+					if (timeStr == "") timeStr = rec.value("time", "");
+					if (timeStr == "") continue;
+					std::string key = tag + "|" + timeStr;
+					if (setKeys.count(key)) continue;
+					setKeys.insert(key);
+					json rNew;
+					rNew["tag"] = tag;
+					rNew["time"] = timeStr;
+					rNew["almVal"] = almVal;
+					rNew["maxVal"] = maxVal;
+					rNew["file"] = rec.value("file", "");
+					rNew["ackTime"] = "";
+					jArr.push_back(rNew);
+					nAdded++;
+				}
+			}
+		}
+	}
+	if (nAdded > 0) {
+		std::sort(jArr.begin(), jArr.end(), [](const json& a, const json& b) {
+			return a.value("time", "") < b.value("time", "");
+		});
+		if (jArr.size() > EM_ALM_MAX_RECORDS) {
+			jArr.erase(jArr.begin(), jArr.begin() + (jArr.size() - EM_ALM_MAX_RECORDS));
+		}
+		emAlmWriteRecords(jArr);
+	}
+	jRlt["added"] = nAdded;
+	jRlt["total"] = jArr.size();
+	LOG("[电梯报警]回填完成,新增%d条,共%zu条", nAdded, jArr.size());
+	return jRlt;
+}
+
 bool rpcHandler::handleMethodCall_unclassified(string method, json& params, RPC_RESP& rpcResp, RPC_SESSION& session)
 {
 	bool bHandled = true;
@@ -3247,6 +3556,66 @@ bool rpcHandler::handleMethodCall_unclassified(string method, json& params, RPC_
 	else if (method == "doAnalyse") {
 		rpc_doAnalyse(params, rpcResp, session);
 	}
+	//电梯监测：读取每位号的报警值配置(映射: tag -> 报警值)
+	else if (method == "getAlmConfig") {
+		string sConf;
+		json jConf = json::object();
+		fs::readFile(tds->conf->confPath + "/alm_config.json", sConf);
+		if (sConf != "") {
+			try { jConf = json::parse(sConf); }
+			catch (const std::exception&) { jConf = json::object(); }
+			if (!jConf.is_object()) jConf = json::object();
+		}
+		rpcResp.result = jConf.dump();
+	}
+	//电梯监测：写入某位号的报警值(value为null表示清除该位号报警值)
+	else if (method == "setAlmConfig") {
+		string tag;
+		if (params.contains("tag") && params["tag"].is_string()) {
+			tag = params["tag"].get<string>();
+		}
+		if (tag == "") {
+			rpcResp.result = RPC_NULL;
+			return true;
+		}
+		string sConf;
+		json jConf = json::object();
+		fs::readFile(tds->conf->confPath + "/alm_config.json", sConf);
+		if (sConf != "") {
+			try { jConf = json::parse(sConf); }
+			catch (const std::exception&) { jConf = json::object(); }
+			if (!jConf.is_object()) jConf = json::object();
+		}
+		if (params.contains("value") && !params["value"].is_null()) {
+			double val = params["value"].get<double>();
+			jConf[tag] = val;
+		}
+		else {
+			jConf.erase(tag);
+		}
+		string sOut = jConf.dump(2);
+		fs::writeFile(tds->conf->confPath + "/alm_config.json", sOut);
+		emAlmReloadConf();
+		rpcResp.result = RPC_OK;
+	}
+	//电梯监测：确认报警记录(params: {all:true} 或 {items:[{tag,time},...]})
+	else if (method == "ackEmAlarms") {
+		json jRlt;
+		if (params.is_object()) {
+			std::lock_guard<std::mutex> lock(s_csEmAlm);
+			jRlt = emAlmAckRecords(params);
+		}
+		else {
+			jRlt["acked"] = 0;
+		}
+		rpcResp.result = jRlt.dump();
+	}
+	//电梯监测：一次性回填历史报警记录(全量扫描db目录,按位号+时间去重,幂等)
+	else if (method == "scanEmAlarms") {
+		std::lock_guard<std::mutex> lock(s_csEmAlm);
+		json jRlt = emAlmBackfillScan();
+		rpcResp.result = jRlt.dump();
+	}
 	else {
 		bHandled = false;
 	}
@@ -3721,6 +4090,17 @@ bool rpcHandler::handleRpcRoute(yyjson_val* jReq, RPC_RESP& rpcResp, RPC_SESSION
 		ioDev* pChildTds = ioSrv.getOwnerChildTdsDev(tag);
 		if (pChildTds) {
 			string childTdsTag = pChildTds->m_strTagBind;
+
+			//位号未带租户根时(管理员会话org为空),子服务绑定位号带租户根会导致trimRoot失效。
+			//此时位号指向的就是子服务自身,用该位号作为root裁剪,得到子服务内的根位号
+			if (childTdsTag.length() > tag.length()) {
+				size_t suffixPos = childTdsTag.length() - tag.length();
+				if (childTdsTag.at(suffixPos - 1) == '.' &&
+					childTdsTag.compare(suffixPos, tag.length(), tag) == 0) {
+					childTdsTag = tag;
+				}
+			}
+
 			string tagInChild = TAG::trimRoot(tag, childTdsTag);
 
 			j["tag"] = tagInChild;
@@ -6585,6 +6965,7 @@ string rpcHandler::getChildTdsRegPkt()
 	jReg["method"] = "devRegister";
 	json jParams;
 	jParams["devType"] = "childTds";
+	jParams["devSubType"] = "childTds";  // 添加 devSubType 参数
 	jParams["httpPort"] = tds->conf->httpPort;
 	jParams["httpsPort"] = tds->conf->httpsPort;
 	jReg["params"] = jParams;

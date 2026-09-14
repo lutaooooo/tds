@@ -1928,6 +1928,26 @@ void ioServer::getAllTDSPDev(vector<ioDev*>& aryDev)
 //如果1个位号是某个TDS下级服务绑定位号的子位号，那么该位号来自于该tds下级服务
 //根据某个位号找所属的TDS下级服务
 ioDev* ioServer::getOwnerChildTdsDev(string tag) {
+	//位号未带租户根时(管理员会话org为空)，子服务绑定位号带租户根会匹配不上。
+	//例如 tag=1号线.天府广场.1号电梯 ,m_strTagBind=B.1号线.天府广场.1号电梯
+	//此时位号指向的就是子服务自身，直接返回
+	if (tag.length() > 0) {
+		for (int i = 0; i < m_vecChildDev.size(); i++) {
+			ioDev* pChildTds = m_vecChildDev[i];
+			if (pChildTds->m_devSubType != TDSP_SUB_TYPE::childTds)
+				continue;
+
+			string& bindTag = pChildTds->m_strTagBind;
+			if (bindTag.length() > tag.length()) {
+				size_t suffixPos = bindTag.length() - tag.length();
+				if (bindTag.at(suffixPos - 1) == '.' &&
+					bindTag.compare(suffixPos, tag.length(), tag) == 0) {
+					return pChildTds;
+				}
+			}
+		}
+	}
+
 	vector<ioDev*> aryChildTds;
 	for (auto& it : m_vecChildDev) {
 		if (it->m_devSubType == TDSP_SUB_TYPE::childTds) {
@@ -2852,7 +2872,7 @@ static void mqtt_broker_fn(struct mg_connection* c, int ev, void* ev_data) {
 			uint8_t suback[] = { (uint8_t)((mm->id >> 8) & 0xFF), (uint8_t)(mm->id & 0xFF), 0 };  // packetId + QoS 0
 			mg_send(c, suback, 3);
 			string topic = str::fromBuff(mm->topic.ptr, mm->topic.len);
-			LOG("[MQTT Broker] 客户端订阅主题: %s", topic.c_str());
+						LOG("[MQTT Broker] 客户端订阅主题: %s", topic.c_str());
 			break;
 		}
 		case MQTT_CMD_UNSUBSCRIBE: {
