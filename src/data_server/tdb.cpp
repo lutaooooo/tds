@@ -1109,6 +1109,8 @@ void diskWriteThread(TDB* pDB) {
 		vecInsert.swap(pDB->m_insertAsynBuff);
 		pDB->m_csInsertAsynBuff.unlock();
 
+		auto oldBuffer = pDB->m_insertBuffSecond;
+		pDB->m_insertBuffSecond = 0;
 		for (int i = 0; i < vecInsert.size(); i++)
 		{
 			INSERT_PARAM* p = vecInsert[i];
@@ -1119,6 +1121,7 @@ void diskWriteThread(TDB* pDB) {
 				pDB->InsertDeJsonStr(p->tag, p->time, p->de, p->buffered);
 			delete p;
 		}
+		pDB->m_insertBuffSecond = oldBuffer;
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
 }
@@ -4636,6 +4639,7 @@ bool TDB::Select_Step_loadDataElem(DE_SELECTOR& deSel, std::vector<TAG_FILE_SET*
 					else {
 						yyTime = yyjson_arr_get(de, 0);
 					}
+					if (yyTime == NULL) continue;
 					const char* szTime;
 					if (yyjson_is_int(yyTime)) {
 						time_t t = yyjson_get_uint(yyTime);
