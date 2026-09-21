@@ -6082,11 +6082,17 @@ FILE* TDB::getDBFileHandle(std::string tag, DB_TIME time, bool& firstDe) {
 	if (!folderExist(folderPath)) {
 		DB_FS::createFolderOfPath(folderPath.c_str());
 	}
-
+#ifdef _WIN32
+	std::wstring wdlpath = DB_STR::utf8_to_utf16(dlPath);
+#endif
 	// Check if the file exists and is not empty
 	bool fileHasData = false;
 	if (fileExist(dlPath)) {
+#ifdef _WIN32
+		_wfopen_s(&fp, wdlpath.c_str(), L"rb");
+#else
 		fp = fopen(dlPath.c_str(), "rb");
+#endif
 		if (fp) {
 			fseek(fp, 0L, SEEK_END);
 			long len = ftell(fp);
@@ -6101,7 +6107,11 @@ FILE* TDB::getDBFileHandle(std::string tag, DB_TIME time, bool& firstDe) {
 
 	if (fileHasData) {
 		// File has data: open in "rb+" to overwrite the trailing ']'
+#ifdef _WIN32
+		_wfopen_s(&fp, wdlpath.c_str(), L"rb+");
+#else
 		fp = fopen(dlPath.c_str(), "rb+");
+#endif
 		if (fp) {
 			// Seek back 1 byte to overwrite the closing bracket
 			fseek(fp, -1L, SEEK_END);
@@ -6110,7 +6120,11 @@ FILE* TDB::getDBFileHandle(std::string tag, DB_TIME time, bool& firstDe) {
 	}
 	else {
 		// File does not exist or is empty: open in "wb+" (truncates the file)
+#ifdef _WIN32
+		_wfopen_s(&fp, wdlpath.c_str(), L"wb+");
+#else
 		fp = fopen(dlPath.c_str(), "wb+");
+#endif
 		if (fp) {
 			static const char* startBracket = "[";
 			fwrite(startBracket, 1, 1, fp);
@@ -6122,7 +6136,7 @@ FILE* TDB::getDBFileHandle(std::string tag, DB_TIME time, bool& firstDe) {
 }
 #endif
 
-#ifdef _WIN32
+#if defined(_WIN32) && _WIN32_WINNT>=0x0600
 bool TDB::InsertValJsonStrBuffer(std::string strTag, std::vector<DE_BUFF>& deBuff) {
 	// Initialize to prevent undefined behavior on the first comparison
 	DB_TIME stLastTime;
