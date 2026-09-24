@@ -6002,6 +6002,93 @@ bool TDB::InsertValJsonStr(std::string strTag, DB_TIME stTime, std::string& sVal
 	return AsynInsertDeJsonStr(strTag, stTime, sDe, buffered);
 }
 
+//把旧格式(首字符'{'的JSON对象)的数据列表文件自动升级为新格式(JSON数组)
+//与非缓冲路径InsertDeJsonStr中的升级逻辑保持一致，供缓冲路径getDBFileHandle追加写入前调用
+bool TDB::upgradeDeListFileFormat(const std::string& dlPath)
+{
+	if (!m_bAutoUpgrade)
+		return true;
+
+	DB_LOCK_GUARD dbLock(dlPath);
+#ifdef _WIN32
+	FILE* fp = _wfopen(DB_STR::utf8_to_utf16(dlPath).c_str(), L"rb+");
+#else
+	FILE* fp = fopen(dlPath.c_str(), "rb+");
+#endif
+	if (!fp)
+		return false;
+
+	fseek(fp, 0L, SEEK_END);
+	long len = ftell(fp);
+	if (len <= 0) { //empty file, nothing to upgrade
+		fclose(fp);
+		return true;
+	}
+
+	//check first charactor is '{' : old compatible format
+	fseek(fp, 0L, SEEK_SET);
+	char c = 0;
+	if (fread(&c, 1, 1, fp) != 1 || c != '{') {
+		fclose(fp);
+		return true; //already new format
+	}
+
+	//read all data
+	char* p = (char*)malloc(len + 1);
+	if (!p) {
+		fclose(fp);
+		return false;
+	}
+	fread(p + 1, 1, len - 1, fp);
+	p[0] = c;
+	p[len] = 0;
+#ifdef _WIN32
+	_chsize_s(_fileno(fp), 0);
+#else
+	ftruncate(fileno(fp), 0);
+#endif
+	fseek(fp, 0L, SEEK_SET);
+
+	//parse and convert
+	yyjson_doc* doc = yyjson_read(p, len, 0);
+	free(p);
+	bool bConvertOld = false;
+	if (doc)
+	{
+		yyjson_mut_doc* new_doc = convertJsonFormat(doc);
+		if (new_doc) {
+			size_t json_len = 0;
+			char* json_str = yyjson_mut_write(new_doc, YYJSON_WRITE_PRETTY, &json_len);
+			if (json_str) {
+				fwrite(json_str, 1, json_len - 1, fp);
+				bConvertOld = true;
+				free(json_str);
+			}
+			yyjson_mut_doc_free(new_doc);
+		}
+		yyjson_doc_free(doc);
+	}
+	if (!bConvertOld) { //old data but cannot upgrade
+		fseek(fp, 0L, SEEK_SET);
+		fwrite("[]", 1, 2, fp);
+	}
+
+	//确保文件以']'结尾：getDBFileHandle会从末尾回退1字节覆盖']'再追加数据，
+	//若升级后的内容漏掉最后的']'，此处补上，否则追加会破坏JSON结构
+	fflush(fp);
+	fseek(fp, 0L, SEEK_END);
+	long newLen = ftell(fp);
+	if (newLen > 0) {
+		char cLast = 0;
+		fseek(fp, newLen - 1L, SEEK_SET);
+		if (fread(&cLast, 1, 1, fp) == 1 && cLast != ']')
+			fwrite("]", 1, 1, fp);
+	}
+
+	fclose(fp);
+	return true;
+}
+
 #if defined(_WIN32) && _WIN32_WINNT>=0x0600 // XP system does not support the function 'SetFileInformationByHandle'.
 void* TDB::getDBFileHandle(std::string tag, DB_TIME time, bool& firstDe) {
 	HANDLE hFile = INVALID_HANDLE_VALUE;
@@ -6030,6 +6117,11 @@ void* TDB::getDBFileHandle(std::string tag, DB_TIME time, bool& firstDe) {
 		}
 	}
 
+	if (fileHasData) {
+		//auto upgrade compatible format to standard format (same as non-buffered path InsertDeJsonStr)
+		upgradeDeListFileFormat(dlPath);
+	}
+
 	std::wstring wPath = DB_STR::utf8_to_utf16(dlPath);
 
 	if (fileHasData) {
@@ -6046,9 +6138,17 @@ void* TDB::getDBFileHandle(std::string tag, DB_TIME time, bool& firstDe) {
 			priorityHint.PriorityHint = IoPriorityHintLow;
 			SetFileInformationByHandle(hFile, FileIoPriorityHintInfo, &priorityHint, sizeof(priorityHint));
 
+			// Peek the char before the closing ']': if it is '[' (empty array "[]"),
+			// the coming insert is the first element and must not be prefixed with a comma
+			firstDe = false;
+			if (SetFilePointer(hFile, -2, NULL, FILE_END) != INVALID_SET_FILE_POINTER) {
+				char cPrev = 0;
+				DWORD dwRead = 0;
+				if (ReadFile(hFile, &cPrev, 1, &dwRead, NULL) && dwRead == 1)
+					firstDe = (cPrev == '[');
+			}
 			// Seek back 1 byte to overwrite the closing bracket
 			SetFilePointer(hFile, -1, NULL, FILE_END);
-			firstDe = false;
 		}
 	}
 	else {
@@ -6106,6 +6206,11 @@ FILE* TDB::getDBFileHandle(std::string tag, DB_TIME time, bool& firstDe) {
 	}
 
 	if (fileHasData) {
+		//auto upgrade compatible format to standard format (same as non-buffered path InsertDeJsonStr)
+		upgradeDeListFileFormat(dlPath);
+	}
+
+	if (fileHasData) {
 		// File has data: open in "rb+" to overwrite the trailing ']'
 #ifdef _WIN32
 		_wfopen_s(&fp, wdlpath.c_str(), L"rb+");
@@ -6113,9 +6218,13 @@ FILE* TDB::getDBFileHandle(std::string tag, DB_TIME time, bool& firstDe) {
 		fp = fopen(dlPath.c_str(), "rb+");
 #endif
 		if (fp) {
+			// Peek the char before the closing ']': if it is '[' (empty array "[]"),
+			// the coming insert is the first element and must not be prefixed with a comma
+			firstDe = false; // Not the first element in this file
+			if (fseek(fp, -2L, SEEK_END) == 0 && fgetc(fp) == '[')
+				firstDe = true;
 			// Seek back 1 byte to overwrite the closing bracket
 			fseek(fp, -1L, SEEK_END);
-			firstDe = false; // Not the first element in this file
 		}
 	}
 	else {

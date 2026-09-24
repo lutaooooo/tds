@@ -1045,6 +1045,8 @@ public:
 public:
 	// convert old datalist file to new format
 	yyjson_mut_doc* convertJsonFormat(yyjson_doc* original_doc);
+	//旧格式(首字符'{')数据列表文件自动升级为新格式(JSON数组)，追加写入前调用
+	bool upgradeDeListFileFormat(const std::string& dlPath);
 
 	//param parse
 	std::map<std::string, std::vector<std::string>> getAggrOpt(yyjson_val* jAggr);
