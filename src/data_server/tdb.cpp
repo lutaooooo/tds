@@ -1115,6 +1115,9 @@ void diskWriteThread(TDB* pDB) {
 			if (p->withDeFile) {
 				pDB->InsertByDeType(p->tag, p->de, p->deType, &p->time);
 			}
+			else if (p->curve.length()>0) {
+				pDB->InsertDeIdxAndCurve(p->tag, p->de, p->curve, &p->time);
+			}
 			else
 				pDB->InsertDeJsonStr(p->tag, p->time, p->de, p->buffered);
 			delete p;
@@ -5869,6 +5872,20 @@ bool TDB::AsynInsertDeJsonStr(std::string strTag, DB_TIME stTime, std::string& s
 	return true;
 }
 
+bool TDB::AsynInsertDeIdxAndCurve(std::string strTag, DB_TIME stTime, std::string& sDe,std::string& sCurve, bool buffered)
+{
+	INSERT_PARAM* param = new INSERT_PARAM();
+	param->buffered = buffered;
+	param->de = sDe;
+	param->tag = strTag;
+	param->time = stTime;
+	param->curve = sCurve;
+	m_csInsertAsynBuff.lock();
+	m_insertAsynBuff.push_back(param);
+	m_csInsertAsynBuff.unlock();
+	return true;
+}
+
 bool TDB::InsertDeJsonStr(std::string strTag, DB_TIME stTime, std::string& sDe, bool buffered)
 {
 	if (!m_enableDB)
@@ -6303,7 +6320,7 @@ bool TDB::Insert(std::string strTag, double dbVal, DB_TIME* stTime, bool buffere
 	return InsertValJsonStr(strTag, dbt, s, buffered);
 }
 
-bool TDB::Insert(std::string strTag, std::string& sDeIdx, std::string& sDeCurve, DB_TIME* time) {
+bool TDB::InsertDeIdxAndCurve(std::string strTag, std::string& sDeIdx, std::string& sDeCurve, DB_TIME* time) {
 	if (!m_enableDB)
 		return false;
 	DB_TIME stTime;
@@ -6340,6 +6357,21 @@ bool TDB::Insert(std::string strTag, std::string& sDeIdx, std::string& sDeCurve,
 	yyjson_mut_doc_free(mdoc);
 	yyjson_doc_free(doc);
 
+	return true;
+}
+
+
+bool TDB::Insert(std::string strTag, std::string& sDeIdx, std::string& sDeCurve, DB_TIME* time,bool buffered) {
+	if (!m_enableDB)
+		return false;
+	DB_TIME stTime;
+	if (time) {
+		stTime = *time;
+	}
+	else {
+		stTime = TIME_OPT::now();
+	}
+	AsynInsertDeIdxAndCurve(strTag, stTime, sDeIdx, sDeCurve, buffered);
 	return true;
 }
 

@@ -615,6 +615,7 @@ struct INSERT_PARAM {
 	std::string tag;
 	std::string de;
 	std::string deType;
+	std::string curve;
 	bool withDeFile;
 	DB_TIME time;
 
@@ -1016,7 +1017,7 @@ public:
 	// custom data element in json format
 	bool Insert(std::string strTag, std::string& sDe,DB_TIME* stTime = nullptr, bool buffered = false);
 	// curve type internal data type of tds, save to file  123000.curve.json in the same path with db.json(datalist file)
-	bool Insert(std::string strTag, std::string& sDeIdx,std::string& sDeCurve, DB_TIME* stTime = nullptr);
+	bool Insert(std::string strTag, std::string& sDeIdx,std::string& sDeCurve, DB_TIME* stTime = nullptr,bool buffered = false);
 	// custom data element in json format
 	bool InsertByDeType(std::string strTag, std::string& sDe, const std::string& sDeType, DB_TIME* stTime = nullptr);
 
@@ -1113,7 +1114,9 @@ public:
 	std::string m_currentPath;
 	fp_dbLog m_fpDBLog;
 	bool AsynInsertDeJsonStr(std::string strTag, DB_TIME stTime, std::string& sDe, bool buffered);
+	bool AsynInsertDeIdxAndCurve(std::string strTag, DB_TIME stTime, std::string& sDe, std::string& sCurve, bool buffered);
 	bool AsynInsertByDeType(std::string strTag, std::string& sDe, const std::string& sDeType, DB_TIME* time);
+	bool InsertDeIdxAndCurve(std::string strTag, std::string& sDeIdx, std::string& sDeCurve, DB_TIME* time);
 };
 unsigned int
 tdb_base64_encode(const unsigned char* in, unsigned int inlen, char* out);
