@@ -20,8 +20,10 @@
 //       带图片/曲线/视频的，记录里的 file、valAttr 字段原样带上，
 //       中心端按约定的 url 规则自行回站机下载。
 //
-// 开关：配置文件中 "dbBeforeInsertNotify": 1 才启用，默认 0=关闭。
+// 开关：站机 tds.ini（或 conf/projectConf.ini）里加一行 dbBeforeInsertNotify=1 才启用，
+//       不加或写 0 = 关闭（ini 格式，不是 json）。
 //       关闭时 saveToDB() 的行为与改动前完全一致（只多一次 bool 判断）。
+//
 //       另受已有的全局开关 g_enableWsNotify 约束（它关闭时 notifyAllSrvAllWs 内部直接返回）。
 //
 // 通知格式与 db.select 的返回保持一致，中心端一套解析逻辑通用：
