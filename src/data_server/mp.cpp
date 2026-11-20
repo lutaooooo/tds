@@ -9,6 +9,65 @@
 #include "ioChan.h"
 #include "mongoose.h"
 #include "json.hpp"
+#include "webSrv.h"
+
+//------------------------------------------------------------------------------
+//【道岔健康管理系统接入】入库前通知
+//
+// 作用：tds 把记录写进数据库之前，通过 websocket 向外广播一条通知，
+//       健康管理系统中心端订阅后即可实时收到数据，不必轮询 db.select。
+//       结构化数据（温湿度、缺口值等）在通知里直接携带；
+//       带图片/曲线/视频的，记录里的 file、valAttr 字段原样带上，
+//       中心端按约定的 url 规则自行回站机下载。
+//
+// 开关：配置文件中 "dbBeforeInsertNotify": 1 才启用，默认 0=关闭。
+//       关闭时 saveToDB() 的行为与改动前完全一致（只多一次 bool 判断）。
+//       另受已有的全局开关 g_enableWsNotify 约束（它关闭时 notifyAllSrvAllWs 内部直接返回）。
+//
+// 通知格式与 db.select 的返回保持一致，中心端一套解析逻辑通用：
+//   {"jsonrpc":"2.0","method":"db.beforeInsert",
+//    "params":{"tag":"<位号>","records":[<记录>]}}
+//
+// 移除本功能：删掉本注释块、isDbBeforeInsertNotifyEnabled()、notifyBeforeInsert()、
+//             以及 saveToDB() 里那一行调用即可，其它代码无需改动。
+//------------------------------------------------------------------------------
+static bool isDbBeforeInsertNotifyEnabled()
+{
+	//配置只读一次。magic static 保证多线程下只初始化一次，无竞态。
+	static const bool enabled = []() -> bool {
+		if (tds != nullptr && tds->conf != nullptr) {
+			return tds->conf->getInt("dbBeforeInsertNotify", 0) != 0;
+		}
+		return false;
+	}();
+	return enabled;
+}
+
+static void notifyBeforeInsert(const std::string& tag, const std::string& sDe)
+{
+	if (!isDbBeforeInsertNotifyEnabled()) {
+		return;
+	}
+
+	std::string sNotify;
+	try {
+		//用 json 库拼而不是手工拼字符串，避免位号里的特殊字符破坏报文
+		json jNotify;
+		jNotify["jsonrpc"] = "2.0";
+		jNotify["method"] = "db.beforeInsert";
+		jNotify["params"]["tag"] = tag;
+		jNotify["params"]["records"].push_back(json::parse(sDe));
+		sNotify = jNotify.dump() + "\n\n";
+	}
+	catch (const std::exception& e) {
+		//单条记录拼坏了不该影响入库，只记日志后照常入库
+		LOG("[error][入库前通知]记录格式错误,tag=" + tag + ",err=" + std::string(e.what()));
+		return;
+	}
+
+	//tag 传真实位号，中心端可以按位号前缀订阅，只收关心的道岔
+	WebServer::notifyAllSrvAllWs("db.beforeInsert", tag, sNotify);
+}
 
 inline string getValTypeLabel(string valType)
 {
@@ -1046,7 +1105,11 @@ void MP::saveToDB() {
 	DB_TIME dbt;
 	dbt.fromStr(m_stDataLastUpdate.toStr(true));
 
+	//【健康管理系统接入】入库前向外通知。开关关闭时本行只做一次 bool 判断，不影响原有行为
+	notifyBeforeInsert(getTag(), sDe);
+
 	db.Insert(getTag().c_str(), sDe, &dbt);
+
 }
 
 //该接口保证rlt或者err一定会有一个值返回
