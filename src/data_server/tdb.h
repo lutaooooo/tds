@@ -949,8 +949,8 @@ public:
 	TDB();
 
 //interface
-	bool Open(std::string strDBUrl, fp_getTagsByTagSelector f = nullptr,std::string name="");
-	bool Open_gbk(std::string strDBUrl, fp_getTagsByTagSelector f = nullptr, std::string name = "");
+	bool Open(std::string strDBUrl, fp_getTagsByTagSelector f = nullptr, std::string name="", std::string strVideoDBTag="");
+	bool Open_gbk(std::string strDBUrl, fp_getTagsByTagSelector f = nullptr, std::string name = "", std::string strVideoDBTag = "");
 	bool setBufferTTL(std::string bufferTTL);
 	bool m_enableDB = true;
 	bool m_enableInsertBuff = false;
@@ -1109,7 +1109,9 @@ public:
 	static bool fileExist(std::string pszFileName);
 	static bool folderExist(std::string pszFileName);
 	std::string m_name; //database name, same as project name
-	std::string m_path; // without a slash in the end.  add a slash if you want to compose a path
+	std::string m_path1; // without a slash in the end.  add a slash if you want to compose a path
+	std::string m_videoTag;
+	std::string getPath(const std::string &tag) const;
 	fp_getTagsByTagSelector m_getTagsByTagSelector;
 	bool m_isGbk;
 	std::string m_confPath;

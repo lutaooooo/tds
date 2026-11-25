@@ -1198,7 +1198,7 @@ std::string TDB::getPath_deFile(std::string strTag, DB_TIME stTime)
 	}
 	else if (m_timeUnit == NONE) {
 		strTag = replaceStr(strTag, ".", "/");
-		std::string strURL = m_path + "/" + strTag;
+		std::string strURL = getPath(strTag) + "/" + strTag;
 		return strURL;
 	}
 	return "";
@@ -1234,7 +1234,7 @@ std::string TDB::getPath_dataFolder(std::string strTag, const DB_TIME& date, con
 			strURL += dbRootTag + "/";
 		}
 		strURL += strTag;
-		strURL = m_path + strURL;
+		strURL = getPath(strTag) + strURL;
 		return strURL;
 	}
 	else if (pathType == "month")
@@ -1247,12 +1247,12 @@ std::string TDB::getPath_dataFolder(std::string strTag, const DB_TIME& date, con
 			strURL += dbRootTag + "/";
 		}
 		strURL += strTag;
-		strURL = m_path + strURL;
+		strURL = getPath(strTag) + strURL;
 		return strURL;
 	}
 	else if (pathType == "none") {
 		strTag = replaceStr(strTag, ".", "/");
-		std::string strURL = m_path + "/" + strTag;
+		std::string strURL = getPath(strTag) + "/" + strTag;
 		return strURL;
 	}
 	return "";
@@ -1292,7 +1292,7 @@ std::string TDB::getPath_dataFolder_NO_DB(std::string strTag, const DB_TIME& dat
 
 std::string TDB::getPath_dbRoot()
 {
-	return m_path;
+	return m_path1;
 }
 
 std::string TDB::getName_deFile(std::string tag, DB_TIME time)
@@ -1492,7 +1492,7 @@ bool TDB::InsertByDeType(std::string strTag, std::string& sDe, const std::string
 			yyjson_val* item;
 			yyjson_arr_foreach(yyv_file, idx, max, item) {
 				std::string url = saveDEFile(item, deFilesFolder, stTime, fileType);
-				url = url.substr(m_path.length(), url.length() - m_path.length());
+				url = url.substr(m_path1.length(), url.length() - m_path1.length());
 				fileUrl.push_back(url);
 			}
 		}
@@ -4964,7 +4964,7 @@ bool TDB::handleRpc(const std::string& method, yyjson_val* params, std::string& 
 		yyjson_mut_doc* mdoc = yyjson_mut_doc_new(nullptr);
 		yyjson_mut_val* yyv_conf = yyjson_mut_obj(mdoc);
 		yyjson_mut_obj_add_val(mdoc, yyv_conf, "lockTTL", yyjson_mut_int(mdoc,DB_LOCK_POOL::lockTTL));
-		yyjson_mut_obj_add_val(mdoc, yyv_conf, "dataPath", yyjson_mut_str(mdoc, db.m_path.c_str()));
+		yyjson_mut_obj_add_val(mdoc, yyv_conf, "dataPath", yyjson_mut_str(mdoc, db.m_path1.c_str()));
         yyjson_mut_obj_add_val(mdoc, yyv_conf, "confPath", yyjson_mut_str(mdoc, db.m_confPath.c_str()));
         yyjson_mut_obj_add_val(mdoc, yyv_conf, "enableFileLock", yyjson_mut_bool(mdoc, DB_LOCK_GUARD::enable));
 		char* p = yyjson_mut_val_write(yyv_conf,0,nullptr);
@@ -7308,22 +7308,24 @@ std::string TDB::saveDEFile(yyjson_val* yyvFileInfo, std::string path, DB_TIME d
 }
 
 
-bool TDB::Open(std::string strDBUrl, fp_getTagsByTagSelector f, std::string name)
+bool TDB::Open(std::string strDBUrl, fp_getTagsByTagSelector f, std::string name, std::string strVideoDBTag)
 {
 	if (strDBUrl == "")
 		return false;
 
-	m_path = replaceStr(strDBUrl, "\\", "/");
+	m_videoTag = strVideoDBTag;
+	m_path1 = replaceStr(strDBUrl, "\\", "/");
 	m_name = name;
 	m_getTagsByTagSelector = f;
 	return true;
 }
 
-bool TDB::Open_gbk(std::string strDBUrl, fp_getTagsByTagSelector f, std::string name)
+bool TDB::Open_gbk(std::string strDBUrl, fp_getTagsByTagSelector f, std::string name, std::string strVideoDBTag)
 {
 	strDBUrl = DB_STR::gb_to_utf8(strDBUrl);
+	strVideoDBTag = DB_STR::gb_to_utf8(strVideoDBTag);
 	m_isGbk = true;
-	return Open(strDBUrl, f, name);
+	return Open(strDBUrl, f, name, strVideoDBTag);
 }
 
 bool TDB::setBufferTTL(std::string bufferTTL)
@@ -7665,11 +7667,21 @@ TDB* TDB::getChildDB(std::string dbName) {
 		p->m_dbFmt = m_dbFmt;
 		p->m_timeUnit = m_timeUnit;
 		p->m_name = dbName;
-		p->m_path = m_path + "/" + dbName;
+		p->m_path1 = m_path1 + "/" + dbName;
 		p->m_getTagsByTagSelector = m_getTagsByTagSelector;
 		m_childDB[dbName] = p;
 		return p;
 	}
+}
+std::string TDB::getPath(const std::string& tag) const
+{
+	if (m_videoTag.empty() || tag.empty()) return m_path1;
+	std::string gbTag = DB_STR::utf8_to_gb(tag);
+	if (gbTag.find("录像") != std::string::npos || gbTag.find("视频") != std::string::npos)
+	{
+		return m_path1 + "/" + m_videoTag;
+	}
+	return m_path1;
 }
 
 std::string TDB::parseSuffix(std::string deFileUrl)
